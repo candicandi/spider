@@ -425,7 +425,6 @@ pub const PgDriver = struct {
             .ptr = @constCast(db_pool orelse @panic("PostgreSQL not initialized")),
             .exec_fn = pgExecFn,
             .deinit_fn = pgDeinitFn,
-            .driver_type = .postgresql,
         };
     }
 };
