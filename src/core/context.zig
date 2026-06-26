@@ -8,7 +8,7 @@ const zmd = @import("../render/zmd/zmd.zig");
 const Hub = @import("../ws/hub.zig").Hub;
 
 const root = @import("root");
-const has_embed = @hasDecl(root, "spider_templates");
+pub const has_embed = @hasDecl(root, "spider_templates");
 
 pub const ViewsMode = enum { runtime, embed };
 
@@ -133,6 +133,7 @@ pub const Ctx = struct {
                     j += 1;
                 }
                 const normalized = buf[0..j];
+                @setEvalBranchQuota(10000);
                 inline for (@typeInfo(Templates).@"struct".field_names) |fname| {
                     if (std.mem.eql(u8, fname, normalized)) {
                         const instance: Templates = .{};
@@ -169,6 +170,7 @@ pub const Ctx = struct {
             }
 
             const embed_inst: Templates = .{};
+            @setEvalBranchQuota(10000);
             inline for (@typeInfo(Templates).@"struct".field_names) |fname| {
                 const content: []const u8 = @field(embed_inst, fname);
                 try components.put(self.arena, try self.arena.dupe(u8, fname), try self.arena.dupe(u8, content));
