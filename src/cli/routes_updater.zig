@@ -18,10 +18,10 @@ pub fn updateMainZig(
     };
     defer allocator.free(existing);
 
-    // 1. Add feature import after "const home = features.home;"
+    // 1. Add feature import (alias to controller) after "const home = features.home;"
     const import_line = try std.fmt.allocPrint(
         allocator,
-        "const {s} = features.{s};\n",
+        "const {s} = features.{s}.controller;\n",
         .{ feature, feature },
     );
     defer allocator.free(import_line);
@@ -51,11 +51,11 @@ pub fn updateMainZig(
     const routes = if (api)
         try std.fmt.allocPrint(
             allocator,
-            "        .get(\"/{s}\", {s}.controller.index, .{{}})\n" ++
-                "        .get(\"/{s}/:id\", {s}.controller.show, .{{}})\n" ++
-                "        .post(\"/{s}\", {s}.controller.create, .{{}})\n" ++
-                "        .patch(\"/{s}/:id\", {s}.controller.update, .{{}})\n" ++
-                "        .delete(\"/{s}/:id\", {s}.controller.delete, .{{}})\n",
+            "        .get(\"/{s}\", {s}.index, .{{}})\n" ++
+                "        .get(\"/{s}/:id\", {s}.show, .{{}})\n" ++
+                "        .post(\"/{s}\", {s}.create, .{{}})\n" ++
+                "        .patch(\"/{s}/:id\", {s}.update, .{{}})\n" ++
+                "        .delete(\"/{s}/:id\", {s}.delete, .{{}})\n",
             .{
                 plural, feature,
                 plural, feature,
@@ -67,12 +67,12 @@ pub fn updateMainZig(
     else
         try std.fmt.allocPrint(
             allocator,
-            "        .get(\"/{s}\", {s}.controller.index, .{{}})\n" ++
-                "        .get(\"/{s}/new\", {s}.controller.newForm, .{{}})\n" ++
-                "        .get(\"/{s}/:id/edit\", {s}.controller.edit, .{{}})\n" ++
-                "        .post(\"/{s}/create\", {s}.controller.create, .{{}})\n" ++
-                "        .post(\"/{s}/:id/update\", {s}.controller.update, .{{}})\n" ++
-                "        .post(\"/{s}/:id/delete\", {s}.controller.delete, .{{}})\n",
+            "        .get(\"/{s}\", {s}.index, .{{}})\n" ++
+                "        .get(\"/{s}/new\", {s}.newForm, .{{}})\n" ++
+                "        .get(\"/{s}/:id/edit\", {s}.edit, .{{}})\n" ++
+                "        .post(\"/{s}/create\", {s}.create, .{{}})\n" ++
+                "        .post(\"/{s}/:id/update\", {s}.update, .{{}})\n" ++
+                "        .post(\"/{s}/:id/delete\", {s}.delete, .{{}})\n",
             .{
                 plural, feature,
                 plural, feature,

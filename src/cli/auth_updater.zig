@@ -77,7 +77,7 @@ pub fn updateMainZig(
     if (!api) {
         const import_marker = "const home = features.home;\n";
         if (std.mem.indexOf(u8, result, import_marker)) |pos| {
-            const auth_import = "const auth = features.auth;\n";
+            const auth_import = "const auth = features.auth.controller;\n";
             const insert_pos = pos + import_marker.len;
             const r = try std.mem.concat(allocator, u8, &.{
                 result[0..insert_pos],
@@ -130,8 +130,8 @@ pub fn updateMainZig(
             "        .use({s}_auth.middleware())\n" ++
                 "        .get(\"/auth/login\", {s}_auth.loginHandler(), .{{}})\n" ++
                 "        .get(\"/auth/callback\", {s}_auth.callbackHandler(), .{{}})\n" ++
-                "        .get(\"/auth/session\", auth.controller.session, .{{}})\n" ++
-                "        .get(\"/auth/logout\", auth.controller.logout, .{{}})\n",
+                "        .get(\"/auth/session\", auth.session, .{{}})\n" ++
+                "        .get(\"/auth/logout\", auth.logout, .{{}})\n",
             .{ provider, provider, provider },
         );
     defer allocator.free(auth_routes);

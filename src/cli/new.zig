@@ -80,14 +80,27 @@ fn readFingerprint(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) ![
     return extractFingerprint(allocator, content);
 }
 
-fn render(allocator: std.mem.Allocator, tmpl: []const u8, app_name: []const u8, fingerprint: []const u8, db_module: []const u8, sqlite_enabled: []const u8) ![]const u8 {
+fn toZonSafe(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    const result = try allocator.dupe(u8, name);
+    for (result) |*c| {
+        switch (c.*) {
+            '-', ' ', '.' => c.* = '_',
+            else => {},
+        }
+    }
+    return result;
+}
+
+fn render(allocator: std.mem.Allocator, tmpl: []const u8, app_name: []const u8, zon_name: []const u8, fingerprint: []const u8, db_module: []const u8, sqlite_enabled: []const u8) ![]const u8 {
     const step1 = try std.mem.replaceOwned(u8, allocator, tmpl, "{{app_name}}", app_name);
     defer allocator.free(step1);
-    const step2 = try std.mem.replaceOwned(u8, allocator, step1, "{{fingerprint}}", fingerprint);
+    const step2 = try std.mem.replaceOwned(u8, allocator, step1, "{{zon_name}}", zon_name);
     defer allocator.free(step2);
-    const step3 = try std.mem.replaceOwned(u8, allocator, step2, "{{db_module}}", db_module);
+    const step3 = try std.mem.replaceOwned(u8, allocator, step2, "{{fingerprint}}", fingerprint);
     defer allocator.free(step3);
-    return std.mem.replaceOwned(u8, allocator, step3, "{{sqlite_enabled}}", sqlite_enabled);
+    const step4 = try std.mem.replaceOwned(u8, allocator, step3, "{{db_module}}", db_module);
+    defer allocator.free(step4);
+    return std.mem.replaceOwned(u8, allocator, step4, "{{sqlite_enabled}}", sqlite_enabled);
 }
 
 fn writeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
@@ -182,6 +195,9 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, app_name: []const u8, use_d
     };
     defer allocator.free(fingerprint);
 
+    const zon_safe_name = try toZonSafe(allocator, app_name);
+    defer allocator.free(zon_safe_name);
+
     std.debug.print("Creating {s}...\n", .{app_name});
 
     const selected_layout_tmpl = if (use_daisyui) layout_daisyui_html_tmpl else layout_html_tmpl;
@@ -240,7 +256,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, app_name: []const u8, use_d
         inline for (api_files) |f| {
             const path = f[0];
             const tmpl = f[1];
-            const content = render(allocator, tmpl, app_name, fingerprint, "", sqlite_enabled) catch |err| {
+            const content = render(allocator, tmpl, app_name, zon_safe_name, fingerprint, "", sqlite_enabled) catch |err| {
                 fail_err = err;
                 return err;
             };
@@ -255,7 +271,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, app_name: []const u8, use_d
         inline for (files) |f| {
             const path = f[0];
             const tmpl = f[1];
-            const content = render(allocator, tmpl, app_name, fingerprint, "", sqlite_enabled) catch |err| {
+            const content = render(allocator, tmpl, app_name, zon_safe_name, fingerprint, "", sqlite_enabled) catch |err| {
                 fail_err = err;
                 return err;
             };
@@ -283,7 +299,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, app_name: []const u8, use_d
     if (!effective_no_db) {
         const db_module = if (use_pg) "pg" else "sqlite";
         const selected_migrations_tmpl = if (use_pg) migrations_zig_pg_tmpl else migrations_zig_sqlite_tmpl;
-        const migrations_content = render(allocator, selected_migrations_tmpl, app_name, fingerprint, db_module, sqlite_enabled) catch |err| {
+        const migrations_content = render(allocator, selected_migrations_tmpl, app_name, zon_safe_name, fingerprint, db_module, sqlite_enabled) catch |err| {
             fail_err = err;
             return err;
         };

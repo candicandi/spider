@@ -972,8 +972,10 @@ pub fn app(decorations: anytype) AppType(@TypeOf(decorations)) {
     var threaded = std.Io.Threaded.init_single_threaded;
     defer threaded.deinit();
     const io = threaded.io();
-    const views_dir = cfg.views_dir orelse "src";
-    s.views_index = views_mod.buildIndex(io, std.heap.smp_allocator, views_dir) catch null;
+    if (ctx_mod.has_embed) {
+        const views_dir = cfg.views_dir orelse "src";
+        s.views_index = views_mod.buildIndex(io, std.heap.smp_allocator, views_dir) catch null;
+    }
 
     health_mod.init();
 
@@ -993,8 +995,10 @@ pub fn appWithConfig(config: Config) Server(EmptyDeco) {
     var threaded = std.Io.Threaded.init_single_threaded;
     defer threaded.deinit();
     const io = threaded.io();
-    const views_dir = config.views_dir orelse "src";
-    s.views_index = views_mod.buildIndex(io, std.heap.smp_allocator, views_dir) catch null;
+    if (ctx_mod.has_embed) {
+        const views_dir = config.views_dir orelse "src";
+        s.views_index = views_mod.buildIndex(io, std.heap.smp_allocator, views_dir) catch null;
+    }
 
     health_mod.init();
 

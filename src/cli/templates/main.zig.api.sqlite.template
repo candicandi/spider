@@ -3,7 +3,6 @@ const spider = @import("spider");
 const features = @import("features");
 const Response = spider.Response;
 const db = spider.sqlite;
-const migrations = @import("core/db/migrations.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();

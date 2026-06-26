@@ -171,7 +171,13 @@ pub const JwksAuth = struct {
             .iss = if (parsed.value.iss) |i| try allocator.dupe(u8, i) else null,
             .exp = parsed.value.exp,
             .nbf = parsed.value.nbf,
-            .realm_access = if (parsed.value.realm_access) |ra| ra else null,
+            .realm_access = if (parsed.value.realm_access) |ra| blk: {
+                var roles_copy = try allocator.alloc([]const u8, ra.roles.len);
+                for (ra.roles, 0..) |role, j| {
+                    roles_copy[j] = try allocator.dupe(u8, role);
+                }
+                break :blk RealmAccess{ .roles = roles_copy };
+            } else null,
         };
     }
 
