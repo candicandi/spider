@@ -35,6 +35,7 @@ pub const rbac = @import("modules/rbac.zig");
 pub const r2 = @import("spider_r2");
 pub const push = @import("modules/push.zig");
 pub const logger = @import("modules/logger.zig").middleware;
+pub const gzip = @import("middlewares/gzip.zig").middleware;
 pub const metrics = @import("internal/metrics.zig");
 pub const env = @import("internal/env.zig");
 pub const template = @import("render/template.zig");
