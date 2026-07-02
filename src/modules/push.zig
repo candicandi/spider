@@ -75,6 +75,7 @@ pub const WebPush = struct {
                 .{ .name = "Content-Encoding", .value = "aes128gcm" },
                 .{ .name = "Content-Type", .value = "application/octet-stream" },
                 .{ .name = "TTL", .value = try std.fmt.allocPrint(arena, "{d}", .{ttl}) },
+                .{ .name = "Urgency", .value = "high" },
             },
         });
         defer res.deinit();
@@ -107,6 +108,7 @@ pub const WebPush = struct {
                 .{ .name = "Content-Encoding", .value = "aes128gcm" },
                 .{ .name = "Content-Type", .value = "application/octet-stream" },
                 .{ .name = "TTL", .value = try std.fmt.allocPrint(c.arena, "{d}", .{ttl}) },
+                .{ .name = "Urgency", .value = "high" },
             },
         });
         defer res.deinit();
