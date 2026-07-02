@@ -55,7 +55,7 @@ pub fn renderNode(node: Node, ctx: *Context, alc: std.mem.Allocator, result: *st
             }
         },
         .for_node => |fnn| {
-            if (ctx.get(fnn.iterable)) |value| {
+            if (resolveValue(ctx, fnn.iterable)) |value| {
                 if (value == .list) {
                     for (value.list, 0..) |elem, idx| {
                         var loop_ctx = try ctx.clone(alc);
@@ -142,53 +142,51 @@ pub fn renderNode(node: Node, ctx: *Context, alc: std.mem.Allocator, result: *st
     }
 }
 
+// Resolves a dotted/bracketed path against the context, walking through
+// nested objects and lists at any depth (e.g. "g.packages[0].id", where
+// "packages" is a list field on the loop-bound object "g", not a top-level
+// context key). Each segment between dots may carry a single "[idx]" suffix.
+fn resolveSegment(current: ?Value, seg: []const u8) ?Value {
+    if (std.mem.indexOfScalar(u8, seg, '[')) |bracket_pos| {
+        const field_name = seg[0..bracket_pos];
+        const close = std.mem.indexOfScalar(u8, seg, ']') orelse return null;
+        const index = std.fmt.parseInt(usize, seg[bracket_pos + 1 .. close], 10) catch return null;
+
+        const list_val = if (field_name.len == 0)
+            current orelse return null
+        else blk: {
+            const c = current orelse return null;
+            if (c != .object) return null;
+            break :blk c.object.get(field_name) orelse return null;
+        };
+
+        if (list_val != .list or index >= list_val.list.len) return null;
+        return list_val.list[index];
+    }
+
+    const c = current orelse return null;
+    if (c != .object) return null;
+    return c.object.get(seg);
+}
+
 fn resolveValue(ctx: *const Context, expr: []const u8) ?Value {
-    if (std.mem.indexOfScalar(u8, expr, '.')) |dot_pos| {
-        const first = expr[0..dot_pos];
-        const rest = expr[dot_pos + 1 ..];
-        if (std.mem.indexOfScalar(u8, first, '[')) |bracket_pos| {
-            const list_name = first[0..bracket_pos];
-            const close = std.mem.indexOfScalar(u8, first, ']') orelse return null;
-            const index_str = first[bracket_pos + 1 .. close];
-            const index = std.fmt.parseInt(usize, index_str, 10) catch return null;
-            if (ctx.get(list_name)) |outer| {
-                if (outer == .list) {
-                    if (index < outer.list.len) {
-                        const elem = outer.list[index];
-                        if (rest.len == 0) return elem;
-                        if (elem == .object) {
-                            return elem.object.get(rest);
-                        }
-                    }
-                }
-            }
-            return null;
+    var it = std.mem.splitScalar(u8, expr, '.');
+    const first_seg = it.next() orelse return null;
+
+    var current: ?Value = if (std.mem.indexOfScalar(u8, first_seg, '[')) |bracket_pos|
+        blk: {
+            const list_name = first_seg[0..bracket_pos];
+            break :blk resolveSegment(ctx.get(list_name), first_seg[bracket_pos..])
+                orelse return null;
         }
-        if (ctx.get(first)) |outer| {
-            if (outer == .object) {
-                if (outer.object.get(rest)) |inner| {
-                    return inner;
-                }
-            }
-        }
-        return null;
+    else
+        ctx.get(first_seg) orelse return null;
+
+    while (it.next()) |seg| {
+        current = resolveSegment(current, seg) orelse return null;
     }
-    // Handle list[ index ] without trailing field access
-    if (std.mem.indexOfScalar(u8, expr, '[')) |bracket_pos| {
-        const list_name = expr[0..bracket_pos];
-        const close = std.mem.indexOfScalar(u8, expr, ']') orelse return null;
-        const index_str = expr[bracket_pos + 1 .. close];
-        const index = std.fmt.parseInt(usize, index_str, 10) catch return null;
-        if (ctx.get(list_name)) |outer| {
-            if (outer == .list) {
-                if (index < outer.list.len) {
-                    return outer.list[index];
-                }
-            }
-        }
-        return null;
-    }
-    return ctx.get(expr);
+
+    return current;
 }
 
 fn evalBool(ctx: *Context, expr: []const u8, alc: std.mem.Allocator) bool {
