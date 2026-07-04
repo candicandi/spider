@@ -278,6 +278,17 @@ fn resolveLen(ctx: *const Context, expr: []const u8, alc: std.mem.Allocator) ![]
             if (v == .list) {
                 return try std.fmt.allocPrint(alc, "{d}", .{v.list.len});
             }
+            if (v == .string) {
+                return try std.fmt.allocPrint(alc, "{d}", .{v.string.len});
+            }
+        }
+        if (resolveValue(ctx, var_name)) |v| {
+            if (v == .list) {
+                return try std.fmt.allocPrint(alc, "{d}", .{v.list.len});
+            }
+            if (v == .string) {
+                return try std.fmt.allocPrint(alc, "{d}", .{v.string.len});
+            }
         }
         return try alc.dupe(u8, "0");
     }
