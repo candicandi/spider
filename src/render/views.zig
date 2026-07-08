@@ -82,8 +82,9 @@ pub fn buildIndex(
             !std.mem.endsWith(u8, entry.path, ".md")) continue;
 
         var name_buf: [256]u8 = undefined;
-        const name = generateFieldName(entry.path, &name_buf) catch continue;
-        if (name.len == 0) continue;
+        var alias_buf: [256]u8 = undefined;
+        const names = generateFieldName(entry.path, &name_buf, &alias_buf) catch continue;
+        if (names.primary.len == 0) continue;
 
         const full_path = try std.fmt.allocPrint(
             allocator,
@@ -92,10 +93,21 @@ pub fn buildIndex(
         );
 
         try entries.append(allocator, .{
-            .name = try allocator.dupe(u8, name),
+            .name = try allocator.dupe(u8, names.primary),
             .path = full_path,
         });
         template_count += 1;
+
+        if (names.alias) |alias| {
+            // Legacy name kept alongside the PascalCase-stripped one for
+            // backward compatibility (see spider-render skill, "Components
+            // Folder" patch) — mirrors generate_templates.zig's embed mode.
+            const alias_path = try allocator.dupe(u8, full_path);
+            try entries.append(allocator, .{
+                .name = try allocator.dupe(u8, alias),
+                .path = alias_path,
+            });
+        }
     }
 
     if (template_count == 0) {
@@ -118,7 +130,14 @@ pub fn buildIndex(
     };
 }
 
-fn generateFieldName(path: []const u8, buffer: []u8) ![]const u8 {
+const FieldNames = struct {
+    primary: []const u8,
+    // Legacy dir-prefixed name, only set when it differs from primary
+    // (i.e. the PascalCase rule actually dropped a directory prefix).
+    alias: ?[]const u8 = null,
+};
+
+fn generateFieldName(path: []const u8, buffer: []u8, alias_buffer: []u8) !FieldNames {
     const no_ext = if (std.mem.endsWith(u8, path, ".html"))
         path[0 .. path.len - 5]
     else if (std.mem.endsWith(u8, path, ".md"))
@@ -140,18 +159,38 @@ fn generateFieldName(path: []const u8, buffer: []u8) ![]const u8 {
                 buffer[j] = if (c == '/' or c == '-') '_' else c;
                 j += 1;
             }
-            return buffer[0..j];
+            return .{ .primary = buffer[0..j] };
         }
 
         if (std.mem.eql(u8, dir, file)) {
-            return try std.fmt.bufPrint(buffer, "{s}", .{file});
+            return .{ .primary = try std.fmt.bufPrint(buffer, "{s}", .{file}) };
         }
         if (file.len > 0 and file[0] >= 'A' and file[0] <= 'Z') {
-            return try std.fmt.bufPrint(buffer, "{s}", .{file});
+            return .{ .primary = try std.fmt.bufPrint(buffer, "{s}", .{file}) };
         }
-        return try std.fmt.bufPrint(buffer, "{s}_{s}", .{ dir, file });
+        return .{ .primary = try std.fmt.bufPrint(buffer, "{s}_{s}", .{ dir, file }) };
     } else if (std.mem.indexOf(u8, no_ext, "templates/")) |idx| {
         const after = no_ext[idx + "templates/".len ..];
+
+        // PascalCase basename (e.g. components/EntrarFragment.html) is a
+        // component: keep the bare name, same convention as the views/
+        // branch above, mirrored from generate_templates.zig's embed mode.
+        const base = std.fs.path.basename(after);
+        if (base.len > 0 and base[0] >= 'A' and base[0] <= 'Z') {
+            const primary = try std.fmt.bufPrint(buffer, "{s}", .{base});
+
+            var j: usize = 0;
+            for (after) |c| {
+                if (j >= alias_buffer.len) break;
+                alias_buffer[j] = if (c == '/' or c == '-') '_' else c;
+                j += 1;
+            }
+            const legacy = alias_buffer[0..j];
+            if (std.mem.eql(u8, legacy, primary)) {
+                return .{ .primary = primary };
+            }
+            return .{ .primary = primary, .alias = legacy };
+        }
 
         var j: usize = 0;
         for (after) |c| {
@@ -159,7 +198,7 @@ fn generateFieldName(path: []const u8, buffer: []u8) ![]const u8 {
             buffer[j] = if (c == '/' or c == '-') '_' else c;
             j += 1;
         }
-        return buffer[0..j];
+        return .{ .primary = buffer[0..j] };
     }
 
     var j: usize = 0;
@@ -168,5 +207,5 @@ fn generateFieldName(path: []const u8, buffer: []u8) ![]const u8 {
         buffer[j] = if (c == '/' or c == '-') '_' else c;
         j += 1;
     }
-    return buffer[0..j];
+    return .{ .primary = buffer[0..j] };
 }

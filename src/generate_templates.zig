@@ -32,12 +32,22 @@ pub fn main(init: std.process.Init) !void {
         if (!std.mem.endsWith(u8, entry.path, ".html") and
             !std.mem.endsWith(u8, entry.path, ".md")) continue;
         var field_name_buf: [256]u8 = undefined;
-        const field_name = try generateFieldName(entry.path, &field_name_buf);
+        var alias_buf: [256]u8 = undefined;
+        const names = try generateFieldName(entry.path, &field_name_buf, &alias_buf);
         const embed_path = entry.path;
-        const line = try std.fmt.allocPrint(allocator, "    {s}: []const u8 = @embedFile(\"{s}\"),\n", .{ field_name, embed_path });
+        const line = try std.fmt.allocPrint(allocator, "    {s}: []const u8 = @embedFile(\"{s}\"),\n", .{ names.primary, embed_path });
         defer allocator.free(line);
         try output.appendSlice(allocator, line);
         template_count += 1;
+        if (names.alias) |alias| {
+            // Legacy name kept alongside the PascalCase-stripped one for
+            // backward compatibility (see spider-render skill, "Components
+            // Folder" patch): old callers of c.view("components_X", ...)
+            // keep working after the primary field lost the dir prefix.
+            const alias_line = try std.fmt.allocPrint(allocator, "    {s}: []const u8 = @embedFile(\"{s}\"),\n", .{ alias, embed_path });
+            defer allocator.free(alias_line);
+            try output.appendSlice(allocator, alias_line);
+        }
     }
     try output.appendSlice(allocator, "\n};\n");
     const out_file = try cwd.createFile(io, output_file, .{});
@@ -49,7 +59,14 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Ride the lightning — {d} templates forged in {s}\n", .{ template_count, output_file });
 }
 
-fn generateFieldName(path: []const u8, buffer: []u8) ![]const u8 {
+const FieldNames = struct {
+    primary: []const u8,
+    // Legacy dir-prefixed name, only set when it differs from primary
+    // (i.e. the PascalCase rule actually dropped a directory prefix).
+    alias: ?[]const u8 = null,
+};
+
+fn generateFieldName(path: []const u8, buffer: []u8, alias_buffer: []u8) !FieldNames {
     const no_ext = if (std.mem.endsWith(u8, path, ".html"))
         path[0 .. path.len - 5]
     else if (std.mem.endsWith(u8, path, ".md"))
@@ -71,16 +88,16 @@ fn generateFieldName(path: []const u8, buffer: []u8) ![]const u8 {
                 buffer[j] = if (c == '/' or c == '-') '_' else c;
                 j += 1;
             }
-            return buffer[0..j];
+            return .{ .primary = buffer[0..j] };
         }
 
         if (std.mem.eql(u8, dir, file)) {
-            return try std.fmt.bufPrint(buffer, "{s}", .{file});
+            return .{ .primary = try std.fmt.bufPrint(buffer, "{s}", .{file}) };
         }
         if (file.len > 0 and file[0] >= 'A' and file[0] <= 'Z') {
-            return try std.fmt.bufPrint(buffer, "{s}", .{file});
+            return .{ .primary = try std.fmt.bufPrint(buffer, "{s}", .{file}) };
         }
-        return try std.fmt.bufPrint(buffer, "{s}_{s}", .{ dir, file });
+        return .{ .primary = try std.fmt.bufPrint(buffer, "{s}_{s}", .{ dir, file }) };
     }
 
     // shared/templates/
@@ -88,10 +105,31 @@ fn generateFieldName(path: []const u8, buffer: []u8) ![]const u8 {
     if (std.mem.startsWith(u8, remaining, "shared/templates/")) {
         remaining = remaining["shared/templates/".len..];
     }
+
+    // PascalCase basename (e.g. components/EntrarFragment.html) is a component:
+    // keep the bare name, same convention as the views/ branch above, so
+    // c.view("EntrarFragment", ...) matches the generated field directly.
+    const base = std.fs.path.basename(remaining);
+    if (base.len > 0 and base[0] >= 'A' and base[0] <= 'Z') {
+        const primary = try std.fmt.bufPrint(buffer, "{s}", .{base});
+
+        var j: usize = 0;
+        for (remaining) |c| {
+            if (j >= alias_buffer.len) break;
+            alias_buffer[j] = if (c == '/' or c == '-') '_' else c;
+            j += 1;
+        }
+        const legacy = alias_buffer[0..j];
+        if (std.mem.eql(u8, legacy, primary)) {
+            return .{ .primary = primary };
+        }
+        return .{ .primary = primary, .alias = legacy };
+    }
+
     var j: usize = 0;
     for (remaining) |c| {
         buffer[j] = if (c == '/' or c == '-') '_' else c;
         j += 1;
     }
-    return buffer[0..j];
+    return .{ .primary = buffer[0..j] };
 }

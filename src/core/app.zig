@@ -1008,7 +1008,10 @@ pub fn app(decorations: anytype) AppType(@TypeOf(decorations)) {
     var threaded = std.Io.Threaded.init_single_threaded;
     defer threaded.deinit();
     const io = threaded.io();
-    if (ctx_mod.has_embed) {
+    if (!ctx_mod.has_embed) {
+        // views_index (disk-scan) is only consulted by Ctx.view() when there's
+        // no embedded Templates struct — building it when has_embed is true
+        // is wasted work, since that branch of view() never reaches vc.index.
         const views_dir = cfg.views_dir orelse "src";
         s.views_index = views_mod.buildIndex(io, std.heap.smp_allocator, views_dir) catch null;
     }
@@ -1031,7 +1034,7 @@ pub fn appWithConfig(config: Config) Server(EmptyDeco) {
     var threaded = std.Io.Threaded.init_single_threaded;
     defer threaded.deinit();
     const io = threaded.io();
-    if (ctx_mod.has_embed) {
+    if (!ctx_mod.has_embed) {
         const views_dir = config.views_dir orelse "src";
         s.views_index = views_mod.buildIndex(io, std.heap.smp_allocator, views_dir) catch null;
     }
