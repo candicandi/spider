@@ -5,7 +5,7 @@ const env = @import("../internal/env.zig");
 const static_mod = @import("../modules/static.zig");
 pub const StaticConfig = static_mod.StaticConfig;
 pub const RouteConfig = struct {
-    roles:     []const []const u8 = &.{},
+    roles: []const []const u8 = &.{},
     org_roles: []const []const u8 = &.{},
 };
 
@@ -18,6 +18,7 @@ const ViewsConfig = ctx_mod.ViewsConfig;
 const Database = @import("database.zig").Database;
 const Router = @import("../routing/router.zig").Router;
 const Handler = @import("../routing/router.zig").Handler;
+const Group = @import("../routing/group.zig").Group;
 const Config = @import("../internal/config.zig").Config;
 const Env = @import("../internal/config.zig").Env;
 const default_config = @import("../internal/config.zig").default;
@@ -28,8 +29,6 @@ const Hub = @import("../ws/hub.zig").Hub;
 const Ws = @import("../ws/ws.zig").Ws;
 const Sse = @import("../ws/sse.zig").Sse;
 const websocket = @import("../ws/websocket.zig");
-
-
 
 const WsRouteHub = struct {
     handler: Handler,
@@ -611,10 +610,14 @@ pub fn Server(comptime T: type) type {
         }
 
         pub fn useAt(self: *Self, path: []const u8, m: MiddlewareFn) *Self {
-            if (self.path_middleware_count < 32) {
-                self.path_middlewares[self.path_middleware_count] = .{ .path = path, .middleware = m };
-                self.path_middleware_count += 1;
+            if (self.path_middleware_count >= self.path_middlewares.len) {
+                std.debug.panic(
+                    "Server.useAt: path middleware capacity exceeded (max {d}) registering \"{s}\"",
+                    .{ self.path_middlewares.len, path },
+                );
             }
+            self.path_middlewares[self.path_middleware_count] = .{ .path = path, .middleware = m };
+            self.path_middleware_count += 1;
             return self;
         }
 
@@ -884,6 +887,39 @@ pub fn Server(comptime T: type) type {
             register: *const fn (*Self, []const u8, []const MiddlewareFn) void,
         ) *Self {
             register(self, prefix, middlewares);
+            return self;
+        }
+
+        pub fn mount(self: *Self, child: Group) *Self {
+            child.router.forEach(std.heap.page_allocator, self, struct {
+                fn cb(s: *Self, method: std.http.Method, path: []const u8, handler: Handler) void {
+                    s.router.add(method, path, handler) catch {};
+                }
+            }.cb);
+
+            const remaining = self.path_middlewares.len - self.path_middleware_count;
+            if (child.path_middleware_count > remaining) {
+                std.debug.panic(
+                    "Server.mount: path middleware capacity exceeded (max {d} total across all .useAt() and .mount() calls) while mounting group prefix \"{s}\" ({d} entries, {d} slots remaining)",
+                    .{ self.path_middlewares.len, child.prefix, child.path_middleware_count, remaining },
+                );
+            }
+            for (child.path_middlewares[0..child.path_middleware_count]) |entry| {
+                self.path_middlewares[self.path_middleware_count] = .{
+                    .path = entry.path,
+                    .middleware = entry.middleware,
+                };
+                self.path_middleware_count += 1;
+            }
+
+            for (child.route_middlewares.items) |entry| {
+                self.route_middlewares.append(std.heap.page_allocator, .{
+                    .path = entry.path,
+                    .method = entry.method,
+                    .middlewares = entry.middlewares,
+                }) catch {};
+            }
+
             return self;
         }
 

@@ -18,17 +18,9 @@ fn statusColor(status: u16) []const u8 {
     return reset;
 }
 
-fn formatLatency(ns: u64, buf: []u8) []const u8 {
-    if (ns < 1000) {
-        return std.fmt.bufPrint(buf, "{d}ns", .{ns}) catch "0ns";
-    }
-    if (ns < 1_000_000) {
-        return std.fmt.bufPrint(buf, "{d}µs", .{ns / 1000}) catch "0µs";
-    }
-    if (ns < 1_000_000_000) {
-        return std.fmt.bufPrint(buf, "{d}ms", .{ns / 1_000_000}) catch "0ms";
-    }
-    return std.fmt.bufPrint(buf, "{d}s", .{ns / 1_000_000_000}) catch "0s";
+fn formatMs(ns: u64, buf: []u8) []const u8 {
+    const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+    return std.fmt.bufPrint(buf, "{d:.1}ms", .{ms}) catch "?ms";
 }
 
 pub fn middleware(c: *Ctx, next: NextFn) anyerror!Response {
@@ -41,8 +33,13 @@ pub fn middleware(c: *Ctx, next: NextFn) anyerror!Response {
         const ns_diff = end.nanoseconds - start.nanoseconds;
         const ns: u64 = if (ns_diff < 0) 0 else @intCast(ns_diff);
         var lat_buf: [32]u8 = undefined;
-        const lat = formatLatency(ns, &lat_buf);
-        std.debug.print("{s: <7} {s}  {s}ERR\x1b[0m  {s}\n", .{ method, path, red, lat });
+        const lat = formatMs(ns, &lat_buf);
+        // The final HTTP status isn't known here: it's decided by .onError()'s
+        // handler (or the default 500 fallback) *after* runChain() returns
+        // control to app.zig's dispatch loop, which is outside this
+        // middleware's visibility. Report the error itself instead of
+        // guessing a status code that may not match what dispatch picks.
+        std.debug.print("{s}[ERR]{s} {s: <6} {s}  {s}  (error: {s})\n", .{ red, reset, method, path, lat, @errorName(err) });
         return err;
     };
 
@@ -54,11 +51,11 @@ pub fn middleware(c: *Ctx, next: NextFn) anyerror!Response {
     const ns: u64 = if (ns_diff < 0) 0 else @intCast(ns_diff);
 
     if (resp.raw) {
-        std.debug.print("{s: <7} {s}  {s}{d}\x1b[0m  open\n", .{ method, path, sc, status_int });
+        std.debug.print("{s}[{d}]{s} {s: <6} {s}  open\n", .{ sc, status_int, reset, method, path });
     } else {
         var lat_buf: [32]u8 = undefined;
-        const lat = formatLatency(ns, &lat_buf);
-        std.debug.print("{s: <7} {s}  {s}{d}\x1b[0m  {s}\n", .{ method, path, sc, status_int, lat });
+        const lat = formatMs(ns, &lat_buf);
+        std.debug.print("{s}[{d}]{s} {s: <6} {s}  {s}\n", .{ sc, status_int, reset, method, path, lat });
     }
 
     return resp;

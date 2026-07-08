@@ -67,6 +67,7 @@ pub const Router = struct {
     fn deinitNode(self: *Router, node: *Node) void {
         var child_it = node.children.iterator();
         while (child_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
             self.deinitNode(entry.value_ptr.*);
         }
         if (node.param_child) |n| {
@@ -110,12 +111,72 @@ pub const Router = struct {
             } else {
                 if (!node.children.contains(segment)) {
                     const child = try Node.init(self.allocator);
-                    try node.children.put(segment, child);
+                    const owned_seg = try self.allocator.dupe(u8, segment);
+                    try node.children.put(owned_seg, child);
                 }
                 node = node.children.get(segment).?;
             }
         }
         node.handlers.set(method, handler);
+    }
+
+    pub fn forEach(self: *Router, allocator: std.mem.Allocator, context: anytype, comptime callback: fn (@TypeOf(context), std.http.Method, []const u8, Handler) void) void {
+        var static_it = self.static_routes.iterator();
+        while (static_it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const handler = entry.value_ptr.*;
+            const slash = std.mem.indexOfScalar(u8, key, '/') orelse continue;
+            const method = std.meta.stringToEnum(std.http.Method, key[0..slash]) orelse continue;
+            callback(context, method, key[slash + 1 ..], handler);
+        }
+
+        var path_buf: std.ArrayList(u8) = .empty;
+        defer path_buf.deinit(allocator);
+        forEachNode(self.root, &path_buf, allocator, context, callback);
+    }
+
+    fn forEachNode(node: *Node, path_buf: *std.ArrayList(u8), allocator: std.mem.Allocator, context: anytype, comptime callback: fn (@TypeOf(context), std.http.Method, []const u8, Handler) void) void {
+        inline for (std.meta.tags(std.http.Method)) |method| {
+            if (node.handlers.get(method)) |h| {
+                callback(context, method, path_buf.items, h);
+            }
+        }
+
+        var child_it = node.children.iterator();
+        while (child_it.next()) |entry| {
+            const seg = entry.key_ptr.*;
+            const start = path_buf.items.len;
+            path_buf.append(allocator, '/') catch return;
+            path_buf.appendSlice(allocator, seg) catch {
+                path_buf.items.len = start;
+                return;
+            };
+            forEachNode(entry.value_ptr.*, path_buf, allocator, context, callback);
+            path_buf.items.len = start;
+        }
+
+        if (node.param_child) |child| {
+            const start = path_buf.items.len;
+            path_buf.append(allocator, '/') catch return;
+            path_buf.append(allocator, ':') catch return;
+            path_buf.appendSlice(allocator, node.param_name.?) catch {
+                path_buf.items.len = start;
+                return;
+            };
+            forEachNode(child, path_buf, allocator, context, callback);
+            path_buf.items.len = start;
+        }
+
+        if (node.wildcard_child) |child| {
+            const start = path_buf.items.len;
+            path_buf.append(allocator, '/') catch return;
+            path_buf.append(allocator, '*') catch {
+                path_buf.items.len = start;
+                return;
+            };
+            forEachNode(child, path_buf, allocator, context, callback);
+            path_buf.items.len = start;
+        }
     }
 
     pub fn match(self: *Router, method: std.http.Method, path: []const u8, allocator: std.mem.Allocator) !?MatchResult {
