@@ -27,7 +27,8 @@ const livereload = @import("../modules/livereload.zig");
 const health_mod = @import("../modules/health.zig");
 const Hub = @import("../ws/hub.zig").Hub;
 const Ws = @import("../ws/ws.zig").Ws;
-const Sse = @import("../ws/sse.zig").Sse;
+const sse_mod = @import("../ws/sse.zig");
+const Sse = sse_mod.Sse;
 const websocket = @import("../ws/websocket.zig");
 
 const WsRouteHub = struct {
@@ -462,50 +463,6 @@ fn buildWsWrapper(comptime handler: fn (*Ws) anyerror!void) Handler {
     return W.call;
 }
 
-fn buildSseWrapper(comptime handler: fn (*Sse) anyerror!void) Handler {
-    const W = struct {
-        pub fn call(ctx: *Ctx) anyerror!Response {
-            const hub = ctx._sse_hub orelse return ctx.text("", .{});
-
-            var write_buf: [512]u8 = undefined;
-            var sw = Io.net.Stream.Writer.init(ctx._stream, ctx._io, &write_buf);
-            const writer = &sw.interface;
-            try writer.writeAll(
-                "HTTP/1.1 200 OK\r\n" ++
-                    "Content-Type: text/event-stream\r\n" ++
-                    "Cache-Control: no-cache\r\n" ++
-                    "Connection: keep-alive\r\n" ++
-                    "Access-Control-Allow-Origin: *\r\n" ++
-                    "\r\n",
-            );
-            try writer.flush();
-
-            var rand_buf: [8]u8 = undefined;
-            std.Io.random(ctx._io, &rand_buf);
-            const conn_id = std.mem.readInt(u64, &rand_buf, .little);
-
-            try hub.add(.{
-                .id = conn_id,
-                .stream = ctx._stream,
-                .type = .sse,
-            });
-            defer hub.remove(conn_id);
-
-            var sse = Sse{
-                ._stream = ctx._stream,
-                ._hub = hub,
-                ._conn_id = conn_id,
-                .params = ctx.params,
-                .arena = ctx.arena,
-                .io = ctx._io,
-            };
-
-            handler(&sse) catch {};
-            return Response{ .raw = true };
-        }
-    };
-    return W.call;
-}
 
 const IntervalEntry = struct {
     hub: *Hub,
@@ -835,11 +792,18 @@ pub fn Server(comptime T: type) type {
             return self;
         }
 
-        pub fn sseInterval(self: *Self, ms: u64, comptime callback: fn (*Hub) void) *Self {
+        // Lazily creates the server's single shared SSE hub. Idempotent —
+        // safe to call from .sse(), .sseInterval(), and mount() (when a
+        // mounted Group has SSE routes of its own).
+        fn ensureSseHub(self: *Self) void {
             if (self.sse_hub == null) {
                 self.sse_threaded = std.Io.Threaded.init_single_threaded;
                 self.sse_hub = Hub.init(std.heap.smp_allocator, self.sse_threaded.?.io());
             }
+        }
+
+        pub fn sseInterval(self: *Self, ms: u64, comptime callback: fn (*Hub) void) *Self {
+            self.ensureSseHub();
             self.interval_threads.append(std.heap.smp_allocator, .{
                 .hub = if (self.sse_hub) |*h| h else unreachable,
                 .ms = ms,
@@ -850,11 +814,8 @@ pub fn Server(comptime T: type) type {
         }
 
         pub fn sse(self: *Self, path: []const u8, comptime handler: fn (*Sse) anyerror!void) *Self {
-            if (self.sse_hub == null) {
-                self.sse_threaded = std.Io.Threaded.init_single_threaded;
-                self.sse_hub = Hub.init(std.heap.smp_allocator, self.sse_threaded.?.io());
-            }
-            const H = buildSseWrapper(handler);
+            self.ensureSseHub();
+            const H = sse_mod.buildHandler(handler);
             self.router.add(.GET, path, H) catch unreachable;
             return self;
         }
@@ -919,6 +880,12 @@ pub fn Server(comptime T: type) type {
                     .middlewares = entry.middlewares,
                 }) catch {};
             }
+
+            // The SSE route itself was already wrapped into a plain Handler
+            // inside Group.sse(), so forEach()'s generic copy above already
+            // carried it over correctly — this only needs to make sure the
+            // server's shared hub exists for it to actually work at runtime.
+            if (child.has_sse) self.ensureSseHub();
 
             return self;
         }

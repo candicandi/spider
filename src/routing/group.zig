@@ -2,6 +2,8 @@ const std = @import("std");
 const Router = @import("router.zig").Router;
 const Handler = @import("router.zig").Handler;
 const MiddlewareFn = @import("../core/context.zig").MiddlewareFn;
+const sse_mod = @import("../ws/sse.zig");
+const Sse = sse_mod.Sse;
 
 const PathMiddlewareEntry = struct {
     path: []const u8,
@@ -28,6 +30,7 @@ pub const Group = struct {
     path_middlewares: [32]PathMiddlewareEntry = undefined,
     path_middleware_count: usize = 0,
     route_middlewares: std.ArrayList(RouteMiddlewareEntry) = .empty,
+    has_sse: bool = false,
 
     pub fn init(prefix: []const u8) Group {
         const r = std.heap.page_allocator.create(Router) catch @panic("OOM");
@@ -65,6 +68,17 @@ pub const Group = struct {
         const full = self.join(path) catch unreachable;
         self.router.add(.DELETE, full, handler) catch unreachable;
         self.registerRoute(.DELETE, path, full, config);
+        return self;
+    }
+
+    // No RBAC config param — Server.sse() doesn't take one either, so this
+    // isn't a new inconsistency. buildHandler lives in ws/sse.zig (not
+    // app.zig) specifically so this can call it without a circular import.
+    pub fn sse(self: *Group, path: []const u8, comptime handler: fn (*Sse) anyerror!void) *Group {
+        const full = self.join(path) catch unreachable;
+        self.router.add(.GET, full, sse_mod.buildHandler(handler)) catch unreachable;
+        self.freeJoined(path, full);
+        self.has_sse = true;
         return self;
     }
 
