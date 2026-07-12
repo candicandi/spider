@@ -1093,3 +1093,70 @@ test "list index access [0] in interpolation" {
         try std.testing.expectEqualStrings("42", r);
     }
 }
+
+test "call syntax and script-tag attributes work inside if blocks too" {
+    // Regression: parseTextNodes (used for if/for bodies) is a separate
+    // code path from Parser.parseInterpolation/parseText — both the call
+    // dispatch and the script/style attribute-vs-body split need to work
+    // there too, not just at the top level.
+    const alc = std.testing.allocator;
+    var tmpl = try Template.init(alc,
+        \\if (show) {
+        \\  <script src='{ url }'>const x = { ignored };</script>
+        \\}
+    );
+    defer tmpl.deinit();
+    const r = try tmpl.render(.{ .show = true, .url = "/app.js" }, alc);
+    defer alc.free(r);
+    try std.testing.expectEqualStrings(
+        "\n  <script src='/app.js'>const x = { ignored };</script>\n",
+        r,
+    );
+}
+
+test "call syntax with no registered helper renders empty" {
+    const alc = std.testing.allocator;
+    var tmpl = try Template.init(alc, "before[{ asset_url(\"app.css\") }]after");
+    defer tmpl.deinit();
+    const r = try tmpl.render(.{}, alc);
+    defer alc.free(r);
+    try std.testing.expectEqualStrings("before[]after", r);
+}
+
+test "script tag attributes are still interpolated" {
+    const alc = std.testing.allocator;
+    var tmpl = try Template.init(alc, "<script src='{ url }'></script>");
+    defer tmpl.deinit();
+    const r = try tmpl.render(.{ .url = "/app.js" }, alc);
+    defer alc.free(r);
+    try std.testing.expectEqualStrings("<script src='/app.js'></script>", r);
+}
+
+test "script tag body is still raw (not template-processed)" {
+    const alc = std.testing.allocator;
+    var tmpl = try Template.init(alc, "<script>const x = { url };</script>");
+    defer tmpl.deinit();
+    const r = try tmpl.render(.{ .url = "ignored" }, alc);
+    defer alc.free(r);
+    try std.testing.expectEqualStrings("<script>const x = { url };</script>", r);
+}
+
+test "style tag attributes are still interpolated, body stays raw" {
+    const alc = std.testing.allocator;
+    var tmpl = try Template.init(alc, "<style data-theme='{ theme }'>[x-cloak] { display: none; }</style>");
+    defer tmpl.deinit();
+    const r = try tmpl.render(.{ .theme = "dark" }, alc);
+    defer alc.free(r);
+    try std.testing.expectEqualStrings("<style data-theme='dark'>[x-cloak] { display: none; }</style>", r);
+}
+
+test "call syntax does not regress plain variable interpolation" {
+    const alc = std.testing.allocator;
+    // Names/paths that could superficially resemble a call must still
+    // resolve as plain variables when there's no "(" right after them.
+    var tmpl = try Template.init(alc, "{ user.name }");
+    defer tmpl.deinit();
+    const r = try tmpl.render(.{ .user = .{ .name = "Seven" } }, alc);
+    defer alc.free(r);
+    try std.testing.expectEqualStrings("Seven", r);
+}

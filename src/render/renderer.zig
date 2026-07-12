@@ -139,6 +139,23 @@ pub fn renderNode(node: Node, ctx: *Context, alc: std.mem.Allocator, result: *st
             }
         },
         .slot => {},
+        .call => |call| {
+            // Same @import-condicional pattern already used for spider_config
+            // (see core/app.zig): the app's build.zig can override the
+            // "template_helpers" module with its own; if it doesn't, the
+            // framework's own build.zig wires an empty default, so this
+            // @import always resolves and unknown calls just render empty.
+            const helpers = @import("template_helpers");
+            inline for (@typeInfo(helpers).@"struct".decl_names) |decl_name| {
+                if (std.mem.eql(u8, decl_name, call.name)) {
+                    const value = @field(helpers, decl_name)(alc, call.args) catch null;
+                    if (value) |v| {
+                        defer alc.free(v);
+                        try result.appendSlice(alc, v);
+                    }
+                }
+            }
+        },
     }
 }
 

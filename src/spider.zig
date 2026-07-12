@@ -3,6 +3,7 @@
 
 const std = @import("std");
 
+pub const Template = @import("render/template.zig").Template;
 pub const Ctx = @import("core/context.zig").Ctx;
 pub const NextFn = @import("core/context.zig").NextFn;
 pub const MiddlewareFn = @import("core/context.zig").MiddlewareFn;

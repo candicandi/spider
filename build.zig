@@ -64,6 +64,19 @@ pub fn build(b: *std.Build) void {
     });
     mod.addImport("spider_config", default_cfg_mod);
 
+    // Default template_helpers fallback for projects without their own
+    // helpers module. Apps override this by calling mod.addImport with a
+    // real template_helpers.zig — see render/renderer.zig's .call case.
+    const default_helpers = b.addWriteFiles();
+    const default_helpers_file = default_helpers.add("template_helpers.zig",
+        \\// No custom template helpers registered — any { name(...) } call in
+        \\// a template renders empty (see render/renderer.zig's .call case).
+    );
+    const default_helpers_mod = b.createModule(.{
+        .root_source_file = default_helpers_file,
+    });
+    mod.addImport("template_helpers", default_helpers_mod);
+
     // spider CLI — `spider new <app_name>`
     const cli_exe = b.addExecutable(.{
         .name = "spider",

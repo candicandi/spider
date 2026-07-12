@@ -29,6 +29,13 @@ pub const Node = union(enum) {
         slot_content: ?[]const u8,
     },
     slot: void,
+    // { name("literal", "literal") } — dispatched at render time to a
+    // function registered in the app's `template_helpers` module. Args are
+    // string literals only (no context-variable resolution) by design.
+    call: struct {
+        name: []const u8,
+        args: [][]const u8,
+    },
 };
 
 pub fn freeNode(node: Node, alc: std.mem.Allocator) void {
@@ -64,5 +71,10 @@ pub fn freeNode(node: Node, alc: std.mem.Allocator) void {
             if (comp.slot_content) |sc| alc.free(sc);
         },
         .slot => {},
+        .call => |c| {
+            alc.free(c.name);
+            for (c.args) |a| alc.free(a);
+            alc.free(c.args);
+        },
     }
 }

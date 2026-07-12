@@ -15,6 +15,57 @@ pub fn trimWhitespace(s: []const u8) []const u8 {
     return s[start..end];
 }
 
+fn isIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+}
+
+fn isIdentChar(c: u8) bool {
+    return isIdentStart(c) or (c >= '0' and c <= '9');
+}
+
+// Recognizes `name("literal", "literal")` — an identifier immediately
+// followed by '(', ending in ')' as the trimmed expression's last byte, with
+// comma-separated string-literal arguments only. Returns null (not an error)
+// for anything else — including malformed/partial call-like text — so the
+// caller falls back to the existing variable-interpolation path unchanged.
+fn tryParseCall(alc: std.mem.Allocator, expr: []const u8) !?Node {
+    if (expr.len == 0 or !isIdentStart(expr[0])) return null;
+
+    var i: usize = 1;
+    while (i < expr.len and isIdentChar(expr[i])) : (i += 1) {}
+    if (i >= expr.len or expr[i] != '(') return null;
+    if (expr[expr.len - 1] != ')') return null;
+
+    const name = expr[0..i];
+    const args_text = trimWhitespace(expr[i + 1 .. expr.len - 1]);
+
+    var args: std.ArrayList([]const u8) = .empty;
+    var ok = true;
+
+    if (args_text.len > 0) {
+        var it = std.mem.splitScalar(u8, args_text, ',');
+        while (it.next()) |raw_arg| {
+            const arg = trimWhitespace(raw_arg);
+            if (arg.len < 2 or arg[0] != '"' or arg[arg.len - 1] != '"') {
+                ok = false;
+                break;
+            }
+            try args.append(alc, try alc.dupe(u8, arg[1 .. arg.len - 1]));
+        }
+    }
+
+    if (!ok) {
+        for (args.items) |a| alc.free(a);
+        args.deinit(alc);
+        return null;
+    }
+
+    return Node{ .call = .{
+        .name = try alc.dupe(u8, name),
+        .args = try args.toOwnedSlice(alc),
+    } };
+}
+
 fn trimString(s: []const u8) []const u8 {
     var start: usize = 0;
     var end: usize = s.len;
@@ -27,6 +78,13 @@ pub const Parser = struct {
     alc: std.mem.Allocator,
     template: []const u8,
     pos: usize,
+    // Set while scanning a <script>/<style> opening tag whose closing '>'
+    // hasn't been reached yet, or while skipping its raw body verbatim.
+    // Lives on the Parser (not a parseText-local) because parseText may
+    // `break` mid-attribute-scan to hand off an interpolation found inside
+    // the opening tag's attributes — a later parseText call must remember
+    // it's still inside that tag to correctly skip the body afterward.
+    raw_skip_close: ?[]const u8 = null,
 
     pub fn init(alc: std.mem.Allocator, template: []const u8) Parser {
         return Parser{ .alc = alc, .template = template, .pos = 0 };
@@ -159,6 +217,10 @@ pub const Parser = struct {
             return parseIfNode(p.alc, trimmed_expr, &sub_pos);
         }
 
+        if (try tryParseCall(p.alc, trimmed_expr)) |call_node| {
+            return call_node;
+        }
+
         if (std.mem.indexOf(u8, expr_raw, " ?? ")) |idx| {
             const expr = trimWhitespace(expr_raw[0..idx]);
             const default_raw = trimWhitespace(expr_raw[idx + 4 ..]);
@@ -178,30 +240,28 @@ pub const Parser = struct {
     fn parseText(p: *Parser) !Node {
         const start = p.pos;
         while (p.pos < p.template.len) {
-            // Skip <script>...</script> and <style>...</style> blocks — do not process template syntax inside them
-            if (std.mem.startsWith(u8, p.template[p.pos..], "<script")) {
-                while (p.pos < p.template.len and p.template[p.pos] != '>') p.pos += 1;
-                if (p.pos < p.template.len) p.pos += 1;
-                while (p.pos < p.template.len) {
-                    if (std.mem.startsWith(u8, p.template[p.pos..], "</script>")) {
-                        p.pos += 9;
-                        break;
-                    }
+            // <script>/<style> bodies are raw — never template-processed,
+            // since real JS/CSS commonly contains literal '{'/'}'. The
+            // OPENING tag's own attributes are not part of that body, so
+            // they still go through the normal scan below (this is what
+            // lets something like <script src='{ asset_url(...) }'> work).
+            if (p.raw_skip_close) |close_tag| {
+                if (p.template[p.pos] == '>') {
                     p.pos += 1;
-                }
-                continue;
-            }
-            if (std.mem.startsWith(u8, p.template[p.pos..], "<style")) {
-                while (p.pos < p.template.len and p.template[p.pos] != '>') p.pos += 1;
-                if (p.pos < p.template.len) p.pos += 1;
-                while (p.pos < p.template.len) {
-                    if (std.mem.startsWith(u8, p.template[p.pos..], "</style>")) {
-                        p.pos += 8;
-                        break;
+                    while (p.pos < p.template.len) {
+                        if (std.mem.startsWith(u8, p.template[p.pos..], close_tag)) {
+                            p.pos += close_tag.len;
+                            break;
+                        }
+                        p.pos += 1;
                     }
-                    p.pos += 1;
+                    p.raw_skip_close = null;
+                    continue;
                 }
-                continue;
+            } else if (std.mem.startsWith(u8, p.template[p.pos..], "<script")) {
+                p.raw_skip_close = "</script>";
+            } else if (std.mem.startsWith(u8, p.template[p.pos..], "<style")) {
+                p.raw_skip_close = "</style>";
             }
             if (std.mem.startsWith(u8, p.template[p.pos..], "{{")) {
                 if (p.pos > start) break;
@@ -399,7 +459,29 @@ pub fn parseTextNodes(alc: std.mem.Allocator, str: []const u8) ![]Node {
 
     var pos: usize = 0;
     var brace_count: usize = undefined;
+    // Same rationale as Parser.raw_skip_close (see parseText): <script>/
+    // <style> bodies are raw, but their opening tag's own attributes still
+    // go through normal interpolation handling. This is a plain local var
+    // (not a struct field) because parseTextNodes processes its whole
+    // input in one call, unlike the top-level Parser loop.
+    var raw_skip_close: ?[]const u8 = null;
     while (pos < str.len) {
+        if (raw_skip_close) |close_tag| {
+            if (str[pos] == '>') {
+                const skip_start = pos;
+                pos += 1;
+                while (pos < str.len) {
+                    if (std.mem.startsWith(u8, str[pos..], close_tag)) {
+                        pos += close_tag.len;
+                        break;
+                    }
+                    pos += 1;
+                }
+                try nodes.append(alc, Node{ .text = try alc.dupe(u8, str[skip_start..pos]) });
+                raw_skip_close = null;
+                continue;
+            }
+        }
         const remaining = str[pos..];
         if (std.mem.startsWith(u8, remaining, "{{")) {
             pos += 2;
@@ -427,6 +509,10 @@ pub fn parseTextNodes(alc: std.mem.Allocator, str: []const u8) ![]Node {
             if (pos >= str.len) return error.UnclosedInterpolation;
             const expr_raw = str[expr_start..pos];
             pos += 2;
+            if (try tryParseCall(alc, trimWhitespace(expr_raw))) |call_node| {
+                try nodes.append(alc, call_node);
+                continue;
+            }
             if (std.mem.indexOf(u8, expr_raw, " ?? ")) |idx| {
                 const expr = trimWhitespace(expr_raw[0..idx]);
                 const default_raw = trimWhitespace(expr_raw[idx + 4 ..]);
@@ -486,8 +572,16 @@ pub fn parseTextNodes(alc: std.mem.Allocator, str: []const u8) ![]Node {
             try nodes.append(alc, node);
         } else {
             const start = pos;
+            if (raw_skip_close == null) {
+                if (std.mem.startsWith(u8, remaining, "<script")) {
+                    raw_skip_close = "</script>";
+                } else if (std.mem.startsWith(u8, remaining, "<style")) {
+                    raw_skip_close = "</style>";
+                }
+            }
             while (pos < str.len) {
                 const r = str[pos..];
+                if (raw_skip_close != null and str[pos] == '>') break;
                 if (std.mem.startsWith(u8, r, "{{")) break;
                 if (std.mem.startsWith(u8, r, "{ ")) break;
                 if (std.mem.startsWith(u8, r, "{ slot }")) break;
