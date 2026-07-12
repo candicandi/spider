@@ -22,14 +22,24 @@ pub const R2Config = struct {
 
 pub const R2 = struct {
     config: R2Config,
+    /// Persistent — created once in init()/initFromEnv(), reused (with its
+    /// connection pool) across every put/get/delete/head/copyObject call
+    /// instead of dialing a fresh TCP+TLS connection every time.
+    client: pacman.Client,
 
-    pub fn init(config: R2Config) R2 {
-        return .{ .config = config };
+    pub fn init(io: std.Io, config: R2Config) !R2 {
+        const base_url = try std.fmt.allocPrint(
+            std.heap.smp_allocator,
+            "https://{s}.r2.cloudflarestorage.com",
+            .{config.account_id},
+        );
+        const client = try pacman.Client.init(io, std.heap.smp_allocator, .{ .base_url = base_url });
+        return .{ .config = config, .client = client };
     }
 
-    pub fn initFromEnv() R2 {
+    pub fn initFromEnv(io: std.Io) !R2 {
         const env = @import("spider").env;
-        return init(.{
+        return init(io, .{
             .account_id = env.getOr("R2_ACCOUNT_ID", ""),
             .access_key = env.getOr("R2_ACCESS_KEY", ""),
             .secret_key = env.getOr("R2_SECRET_KEY", ""),
@@ -38,9 +48,13 @@ pub const R2 = struct {
         });
     }
 
+    pub fn deinit(self: *R2) void {
+        self.client.deinit();
+    }
+
     // ─── Operations ──────────────────────────────────────────────
 
-    pub fn put(self: *const R2, c: *Ctx, key: []const u8, body: []const u8, content_type: []const u8) !void {
+    pub fn put(self: *R2, c: *Ctx, key: []const u8, body: []const u8, content_type: []const u8) !void {
         const host = try self.endpointHost(c.arena);
         const path = try self.requestPath(c.arena, key);
         const payload_hash = try sha256Hex(c.arena, body);
@@ -52,7 +66,8 @@ pub const R2 = struct {
             .path = .{ .percent_encoded = path },
         };
 
-        var res = try pacman.put(c._io, c.arena, "", .{
+        var res = try pacman.request(c._io, c.arena, "", .{
+            .method = .PUT,
             .uri = uri,
             .body = .{ .raw = body },
             .headers = &.{
@@ -62,7 +77,7 @@ pub const R2 = struct {
                 .{ .name = "Content-Type", .value = content_type },
                 .{ .name = "Connection", .value = "close" },
             },
-        });
+        }, &self.client.http_client);
         defer res.deinit();
 
         if (res.status != .ok and res.status != .no_content) {
@@ -72,7 +87,53 @@ pub const R2 = struct {
         }
     }
 
-    pub fn get(self: *const R2, c: *Ctx, key: []const u8) ![]u8 {
+    /// Copia um objeto server-side (R2 -> R2), sem baixar o body pro cliente.
+    /// x-amz-copy-source segue o formato "/{bucket}/{key-url-encoded}" — igual
+    /// ao que requestPath() ja produz, reusado aqui pra montar o valor do header
+    /// (confirmado na doc do CopyObject da AWS S3, que R2 implementa).
+    /// CopyObject nao tem corpo de requisicao, entao o payload_hash e o de
+    /// string vazia (mesmo padrao ja usado em get/delete/head).
+    pub fn copyObject(self: *R2, c: *Ctx, source_key: []const u8, dest_key: []const u8) !void {
+        const host = try self.endpointHost(c.arena);
+        const dest_path = try self.requestPath(c.arena, dest_key);
+        const copy_source = try self.requestPath(c.arena, source_key);
+        const payload_hash = try sha256Hex(c.arena, "");
+        const signed = try self.signRequest(c.arena, "PUT", dest_key, payload_hash, &.{
+            .{ "x-amz-copy-source", copy_source },
+        });
+
+        const uri = std.Uri{
+            .scheme = "https",
+            .host = .{ .raw = host },
+            .path = .{ .percent_encoded = dest_path },
+        };
+
+        // No "Connection: close" here (unlike put/delete): CopyObject returns
+        // 200 with a real XML body (ETag/LastModified), not a bodyless
+        // response — the transfer_encoding=none+content_length=null read-hang
+        // risk that close guards against doesn't apply, so this call can
+        // safely reuse the persistent connection pool.
+        var res = try pacman.request(c._io, c.arena, "", .{
+            .method = .PUT,
+            .uri = uri,
+            .body = .{ .raw = "" },
+            .headers = &.{
+                .{ .name = "Authorization", .value = signed.authorization },
+                .{ .name = "X-Amz-Date", .value = signed.x_amz_date },
+                .{ .name = "X-Amz-Content-Sha256", .value = signed.x_amz_content_sha256 },
+                .{ .name = "x-amz-copy-source", .value = copy_source },
+            },
+        }, &self.client.http_client);
+        defer res.deinit();
+
+        if (res.status != .ok) {
+            const res_body = res.text();
+            std.log.err("r2 copyObject failed status={d} dest={s} source={s} body={s}", .{ @intFromEnum(res.status), dest_path, copy_source, res_body });
+            return error.R2CopyFailed;
+        }
+    }
+
+    pub fn get(self: *R2, c: *Ctx, key: []const u8) ![]u8 {
         const host = try self.endpointHost(c.arena);
         const path = try self.requestPath(c.arena, key);
         const payload_hash = try sha256Hex(c.arena, "");
@@ -84,14 +145,15 @@ pub const R2 = struct {
             .path = .{ .percent_encoded = path },
         };
 
-        var res = try pacman.get(c._io, c.arena, "", .{
+        var res = try pacman.request(c._io, c.arena, "", .{
+            .method = .GET,
             .uri = uri,
             .headers = &.{
                 .{ .name = "Authorization", .value = signed.authorization },
                 .{ .name = "X-Amz-Date", .value = signed.x_amz_date },
                 .{ .name = "X-Amz-Content-Sha256", .value = signed.x_amz_content_sha256 },
             },
-        });
+        }, &self.client.http_client);
         defer res.deinit();
 
         if (res.status == .not_found) return error.NotFound;
@@ -102,7 +164,7 @@ pub const R2 = struct {
         return c.arena.dupe(u8, res.text());
     }
 
-    pub fn delete(self: *const R2, c: *Ctx, key: []const u8) !void {
+    pub fn delete(self: *R2, c: *Ctx, key: []const u8) !void {
         const host = try self.endpointHost(c.arena);
         const path = try self.requestPath(c.arena, key);
         const payload_hash = try sha256Hex(c.arena, "");
@@ -114,7 +176,8 @@ pub const R2 = struct {
             .path = .{ .percent_encoded = path },
         };
 
-        var res = try pacman.delete(c._io, c.arena, "", .{
+        var res = try pacman.request(c._io, c.arena, "", .{
+            .method = .DELETE,
             .uri = uri,
             .headers = &.{
                 .{ .name = "Authorization", .value = signed.authorization },
@@ -122,14 +185,14 @@ pub const R2 = struct {
                 .{ .name = "X-Amz-Content-Sha256", .value = signed.x_amz_content_sha256 },
                 .{ .name = "Connection", .value = "close" },
             },
-        });
+        }, &self.client.http_client);
         defer res.deinit();
 
         if (res.status == .not_found) return error.NotFound;
         if (res.status != .ok and res.status != .no_content) return error.R2DeleteFailed;
     }
 
-    pub fn head(self: *const R2, c: *Ctx, key: []const u8) !bool {
+    pub fn head(self: *R2, c: *Ctx, key: []const u8) !bool {
         const host = try self.endpointHost(c.arena);
         const path = try self.requestPath(c.arena, key);
         const payload_hash = try sha256Hex(c.arena, "");
@@ -141,14 +204,15 @@ pub const R2 = struct {
             .path = .{ .percent_encoded = path },
         };
 
-        var res = try pacman.head(c._io, c.arena, "", .{
+        var res = try pacman.request(c._io, c.arena, "", .{
+            .method = .HEAD,
             .uri = uri,
             .headers = &.{
                 .{ .name = "Authorization", .value = signed.authorization },
                 .{ .name = "X-Amz-Date", .value = signed.x_amz_date },
                 .{ .name = "X-Amz-Content-Sha256", .value = signed.x_amz_content_sha256 },
             },
-        });
+        }, &self.client.http_client);
         defer res.deinit();
 
         if (res.status == .not_found) return false;
@@ -353,29 +417,33 @@ pub const R2 = struct {
         const host = try self.endpointHost(allocator);
         const path = try self.requestPath(allocator, key);
 
+        // SigV4 exige CanonicalHeaders/SignedHeaders em ordem alfabetica por
+        // nome — monta todos os headers (fixos + extras) e ordena antes de
+        // construir as strings, em vez de assumir uma ordem fixa.
+        var all_headers = std.ArrayList([2][]const u8).empty;
+        defer all_headers.deinit(allocator);
+        try all_headers.append(allocator, .{ "host", host });
+        try all_headers.append(allocator, .{ "x-amz-content-sha256", payload_hash });
+        try all_headers.append(allocator, .{ "x-amz-date", datetime_str });
+        for (extra_headers) |h| try all_headers.append(allocator, h);
+
+        std.mem.sort([2][]const u8, all_headers.items, {}, struct {
+            fn lessThan(_: void, a: [2][]const u8, b: [2][]const u8) bool {
+                return std.mem.lessThan(u8, a[0], b[0]);
+            }
+        }.lessThan);
+
         var canonical_headers = std.ArrayList(u8).empty;
         defer canonical_headers.deinit(allocator);
-
-        try canonical_headers.appendSlice(allocator, "host:");
-        try canonical_headers.appendSlice(allocator, host);
-        try canonical_headers.append(allocator, '\n');
-        try canonical_headers.appendSlice(allocator, "x-amz-content-sha256:");
-        try canonical_headers.appendSlice(allocator, payload_hash);
-        try canonical_headers.append(allocator, '\n');
-        try canonical_headers.appendSlice(allocator, "x-amz-date:");
-        try canonical_headers.appendSlice(allocator, datetime_str);
-        try canonical_headers.append(allocator, '\n');
-
         var signed_headers = std.ArrayList(u8).empty;
         defer signed_headers.deinit(allocator);
-        try signed_headers.appendSlice(allocator, "host;x-amz-content-sha256;x-amz-date");
 
-        for (extra_headers) |h| {
+        for (all_headers.items, 0..) |h, i| {
             try canonical_headers.appendSlice(allocator, h[0]);
             try canonical_headers.append(allocator, ':');
             try canonical_headers.appendSlice(allocator, h[1]);
             try canonical_headers.append(allocator, '\n');
-            try signed_headers.append(allocator, ';');
+            if (i > 0) try signed_headers.append(allocator, ';');
             try signed_headers.appendSlice(allocator, h[0]);
         }
 
@@ -509,12 +577,17 @@ test "sha256Hex known value" {
 
 test "R2 signRequest produces valid authorization header" {
     const allocator = std.testing.allocator;
-    const r2 = R2.init(.{
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var r2 = try R2.init(io, .{
         .account_id = "testaccount",
         .access_key = "AKIAIOSFODNN7EXAMPLE",
         .secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
         .bucket = "my-bucket",
     });
+    defer r2.deinit();
 
     const payload_hash = try sha256Hex(allocator, "hello world");
     defer allocator.free(payload_hash);
@@ -528,13 +601,18 @@ test "R2 signRequest produces valid authorization header" {
 
 test "R2 publicUrl" {
     const allocator = std.testing.allocator;
-    const r2 = R2.init(.{
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var r2 = try R2.init(io, .{
         .account_id = "test",
         .access_key = "key",
         .secret_key = "secret",
         .bucket = "bucket",
         .pub_url = "https://pub-xyz.r2.dev",
     });
+    defer r2.deinit();
     const url = try r2.publicUrl(allocator, "folder/file.txt");
     defer allocator.free(url);
     try std.testing.expectEqualStrings("https://pub-xyz.r2.dev/folder/file.txt", url);
@@ -542,12 +620,17 @@ test "R2 publicUrl" {
 
 test "R2 objectKey" {
     const allocator = std.testing.allocator;
-    const r2 = R2.init(.{
+    var threaded: std.Io.Threaded = .init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var r2 = try R2.init(io, .{
         .account_id = "test",
         .access_key = "key",
         .secret_key = "secret",
         .bucket = "bucket",
     });
+    defer r2.deinit();
     const key = try r2.objectKey(allocator, "tenant-123", "boletos", "jan.pdf");
     defer allocator.free(key);
     try std.testing.expectEqualStrings("tenant-123/boletos/jan.pdf", key);
