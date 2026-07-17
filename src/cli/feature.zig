@@ -11,7 +11,6 @@ const mod_api_tmpl = @embedFile("templates/feature/mod.zig.api.template");
 const model_tmpl = @embedFile("templates/feature/model.zig.template");
 const repository_sqlite_tmpl = @embedFile("templates/feature/repository.zig.template");
 const repository_pg_tmpl = @embedFile("templates/feature/repository.zig.pg.template");
-const presenter_tmpl = @embedFile("templates/feature/presenter.zig.template");
 const controller_tmpl = @embedFile("templates/feature/controller.zig.template");
 const controller_api_sqlite_tmpl = @embedFile("templates/feature/controller.zig.api.sqlite.template");
 const controller_api_pg_tmpl = @embedFile("templates/feature/controller.zig.api.pg.template");
@@ -77,9 +76,6 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, feature: []const u8, api: b
     const controller_content = try template_engine.renderTemplate(allocator, controller_tmpl_selected, feature, plural);
     defer allocator.free(controller_content);
 
-    const presenter_content = try template_engine.renderTemplate(allocator, presenter_tmpl, feature, plural);
-    defer allocator.free(presenter_content);
-
     const index_html_content = try template_engine.renderTemplate(allocator, index_html_tmpl, feature, plural);
     defer allocator.free(index_html_content);
 
@@ -135,11 +131,6 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, feature: []const u8, api: b
 
     try fs_utils.writeFile(io, feature_dir, "repository.zig", repository_content);
     std.debug.print("  create  src/features/{s}/repository.zig\n", .{feature});
-
-    if (!api) {
-        try fs_utils.writeFile(io, feature_dir, "presenter.zig", presenter_content);
-        std.debug.print("  create  src/features/{s}/presenter.zig\n", .{feature});
-    }
 
     try fs_utils.writeFile(io, feature_dir, "controller.zig", controller_content);
     std.debug.print("  create  src/features/{s}/controller.zig\n", .{feature});

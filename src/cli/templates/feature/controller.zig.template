@@ -2,12 +2,11 @@ const std = @import("std");
 const spider = @import("spider");
 const model = @import("model.zig");
 const repository = @import("repository.zig");
-const presenter = @import("presenter.zig");
 const Response = spider.Response;
 
 pub fn index(c: *spider.Ctx) !Response {
     const items = try repository.findAll(c.arena);
-    const context = try presenter.build{{Feature}}ListContext(c.arena, items);
+    const context = .{ .{{plural}} = items, .page_title = "{{plural}}" };
     if (c.isHtmx()) return c.view("{{feature}}/index", context, .{});
     return c.view("{{feature}}/page", context, .{});
 }
