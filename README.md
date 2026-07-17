@@ -1,4 +1,4 @@
-# <img src="assets/spider_logo.png" width="32" height="32" alt="Spider Logo"> Spider v0.6.8
+# <img src="assets/spider_logo.png" width="32" height="32" alt="Spider Logo"> Spider v0.6.9
 
 Build web servers in Zig — performant, productive, and batteries-included.
 
@@ -22,7 +22,7 @@ curl -fsSL https://spiderme.org/install.sh | bash
 Or specify a version:
 
 ```bash
-curl -fsSL https://spiderme.org/install.sh | bash -s -- --version v0.6.8
+curl -fsSL https://spiderme.org/install.sh | bash -s -- --version v0.6.9
 ```
 
 ### Manual Install
@@ -1301,7 +1301,7 @@ spider migrate
 
 # Show version
 spider version
-# spider v0.6.8
+# spider v0.6.9
 ```
 
 ---
