@@ -8,8 +8,8 @@ const Response = spider.Response;
 pub fn index(c: *spider.Ctx) !Response {
     const items = try repository.findAll(c.arena);
     const context = try presenter.build{{Feature}}ListContext(c.arena, items);
-    if (c.isHtmx()) return c.view("{{plural}}/index", context, .{});
-    return c.view("{{plural}}/page", context, .{});
+    if (c.isHtmx()) return c.view("{{feature}}/index", context, .{});
+    return c.view("{{feature}}/page", context, .{});
 }
 
 pub fn newForm(c: *spider.Ctx) !Response {

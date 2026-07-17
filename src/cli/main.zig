@@ -4,6 +4,8 @@ const generate = @import("generate.zig");
 const install = @import("install.zig");
 const generate_vapid = @import("generate_vapid.zig");
 const migrate = @import("migrate.zig");
+const update = @import("update.zig");
+const self_update = @import("self_update.zig");
 
 const version = "0.6.8";
 
@@ -25,6 +27,8 @@ const usage =
     \\  spider generate-vapid           Generate VAPID keys for Web Push
     \\  spider install                 Download frontend assets (tailwindcss, alpine, htmx, icons)
     \\  spider migrate                 Run pending database migrations
+    \\  spider update                  Update the spider dependency in this project
+    \\  spider self-update             Update the spider CLI itself
     \\  spider version                 Show CLI version
     \\  spider help                    Show this help
     \\
@@ -86,6 +90,10 @@ pub fn main(init: std.process.Init) !void {
         try generate.run(io, allocator, subcommand, &args);
     } else if (std.mem.eql(u8, command, "migrate")) {
         try migrate.run(io, allocator);
+    } else if (std.mem.eql(u8, command, "update")) {
+        try update.run(io);
+    } else if (std.mem.eql(u8, command, "self-update")) {
+        try self_update.run(io);
     } else if (std.mem.eql(u8, command, "install")) {
         try install.run(io, allocator, std.Io.Dir.cwd());
     } else if (std.mem.eql(u8, command, "generate-vapid")) {

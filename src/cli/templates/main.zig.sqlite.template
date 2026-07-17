@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
     defer server.deinit();
 
     server
-        .get("/", home.index, .{})
+        .get("/", home.controller.index, .{})
         .onError(errorHandler)
         .listen(.{ .port = 3000, .host = "0.0.0.0" }) catch |err| return err;
 }

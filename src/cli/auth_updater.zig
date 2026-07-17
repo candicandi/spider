@@ -77,7 +77,7 @@ pub fn updateMainZig(
     if (!api) {
         const import_marker = "const home = features.home;\n";
         if (std.mem.indexOf(u8, result, import_marker)) |pos| {
-            const auth_import = "const auth = features.auth.controller;\n";
+            const auth_import = "const auth = features.auth;\n";
             const insert_pos = pos + import_marker.len;
             const r = try std.mem.concat(allocator, u8, &.{
                 result[0..insert_pos],
@@ -115,7 +115,7 @@ pub fn updateMainZig(
 
     // 7. Add middleware + auth routes before first route or .onError(
     //    Try .get("/", home.index, .{}) first (non-API), fall back to .onError( (API)
-    const home_route_marker = ".get(\"/\", home.index, .{})";
+    const home_route_marker = ".get(\"/\", home.controller.index, .{})";
     const onerror_marker = ".onError(";
     const routes_marker = if (std.mem.indexOf(u8, result, home_route_marker)) |_| home_route_marker else onerror_marker;
     const auth_routes = if (api)
@@ -130,8 +130,8 @@ pub fn updateMainZig(
             "        .use({s}_auth.middleware())\n" ++
                 "        .get(\"/auth/login\", {s}_auth.loginHandler(), .{{}})\n" ++
                 "        .get(\"/auth/callback\", {s}_auth.callbackHandler(), .{{}})\n" ++
-                "        .get(\"/auth/session\", auth.session, .{{}})\n" ++
-                "        .get(\"/auth/logout\", auth.logout, .{{}})\n",
+                "        .get(\"/auth/session\", auth.controller.session, .{{}})\n" ++
+                "        .get(\"/auth/logout\", auth.controller.logout, .{{}})\n",
             .{ provider, provider, provider },
         );
     defer allocator.free(auth_routes);
