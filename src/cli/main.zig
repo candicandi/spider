@@ -7,7 +7,7 @@ const migrate = @import("migrate.zig");
 const update = @import("update.zig");
 const self_update = @import("self_update.zig");
 
-const version = "0.6.8";
+const version = "0.6.9";
 
 const usage =
     \\Spider CLI — spiderme.org
