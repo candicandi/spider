@@ -26,6 +26,10 @@
         .zqlite = .{
             .path = "modules/sqlite/sqlite_driver_impl",
         },
+        .spider = .{
+            .url = "git+https://github.com/llllOllOOll/spider#1db1e0811c43e60e5a1064ab9e076ad8a3165828",
+            .hash = "spider-0.6.8-P7cGrgfCrwAPck9nPmJmbCh42dXPiki-XHAVaIpwSSG4",
+        },
     },
     .paths = .{
         "build.zig",
