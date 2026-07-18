@@ -34,6 +34,7 @@ pub const livereload = @import("modules/livereload.zig");
 pub const health = @import("modules/health.zig");
 pub const rbac = @import("modules/rbac.zig");
 pub const r2 = @import("spider_r2");
+pub const qrcode = @import("spider_qrcode");
 pub const push = @import("modules/push.zig");
 pub const logger = @import("modules/logger.zig").middleware;
 pub const gzip = @import("middlewares/gzip.zig").middleware;

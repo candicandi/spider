@@ -1,0 +1,7 @@
+.{
+    .name = .spider_qrcode,
+    .version = "0.1.0",
+    .paths = .{""},
+    .fingerprint = 0xe7b4929c98270f09,
+    .dependencies = .{},
+}
