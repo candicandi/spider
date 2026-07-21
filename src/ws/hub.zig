@@ -283,8 +283,8 @@ fn makeSocketPair() ![2]net.Socket {
     const rc = posix.system.socketpair(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0, &fds);
     if (rc != 0) return error.Unexpected;
     return .{
-        net.Socket{ .handle = fds[0], .address = .{ .ip4 = .{ .bytes = .{0} * *4, .port = 0 } } },
-        net.Socket{ .handle = fds[1], .address = .{ .ip4 = .{ .bytes = .{0} * *4, .port = 0 } } },
+        net.Socket{ .handle = fds[0], .address = .{ .ip4 = .{ .bytes = [4]u8{ 0, 0, 0, 0 }, .port = 0 } } },
+        net.Socket{ .handle = fds[1], .address = .{ .ip4 = .{ .bytes = [4]u8{ 0, 0, 0, 0 }, .port = 0 } } },
     };
 }
 
@@ -302,7 +302,11 @@ test "Hub: add increases count" {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     const sockets = try makeSocketPair();
-    defer sockets[0].close(io);
+    // sockets[0] is handed to the Hub below and stays registered for the
+    // whole test — Hub.deinit() closes every registered connection's stream,
+    // so a separate `defer sockets[0].close(io)` here would double-close it
+    // (crashes as EBADF/use-after-free in debug builds). Only sockets[1] —
+    // never owned by the Hub — needs its own defer.
     defer sockets[1].close(io);
     var hub = Hub.init(testing.allocator, io);
     defer hub.deinit();
@@ -335,7 +339,9 @@ test "Hub: broadcast writes valid WS frame" {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     const sockets = try makeSocketPair();
-    defer sockets[0].close(io);
+    // sockets[0] stays registered in the Hub (write succeeds, never removed)
+    // — see the comment in "Hub: add increases count" for why it must not
+    // also be closed here.
     defer sockets[1].close(io);
     var hub = Hub.init(testing.allocator, io);
     defer hub.deinit();
@@ -375,9 +381,10 @@ test "Hub: broadcast delivers to all connections" {
     const io = threaded.io();
     const sockets_a = try makeSocketPair();
     const sockets_b = try makeSocketPair();
-    defer sockets_a[0].close(io);
+    // Both sockets_a[0] and sockets_b[0] are handed to the Hub below and stay
+    // registered for the whole test (broadcast succeeds, nothing removed) —
+    // see "Hub: add increases count" for why they must not also be closed here.
     defer sockets_a[1].close(io);
-    defer sockets_b[0].close(io);
     defer sockets_b[1].close(io);
     var hub = Hub.init(testing.allocator, io);
     defer hub.deinit();
@@ -407,7 +414,9 @@ test "Hub: add duplicate id returns error" {
     const io = threaded.io();
     const sockets_a = try makeSocketPair();
     const sockets_b = try makeSocketPair();
-    defer sockets_a[0].close(io);
+    // sockets_a[0] is handed to the Hub and stays registered — see "Hub: add
+    // increases count". sockets_b[0] is REJECTED (duplicate id), so it's
+    // never Hub-owned and keeps its own defer close.
     defer sockets_a[1].close(io);
     defer sockets_b[0].close(io);
     defer sockets_b[1].close(io);
@@ -427,9 +436,10 @@ test "Hub: broadcastToChannel delivers only to matching channel" {
     const io = threaded.io();
     const sockets_a = try makeSocketPair();
     const sockets_b = try makeSocketPair();
-    defer sockets_a[0].close(io);
+    // Both sockets_a[0] (targeted, write succeeds) and sockets_b[0] (never
+    // targeted, no removal ever triggered for it) stay registered through
+    // the whole test — see "Hub: add increases count".
     defer sockets_a[1].close(io);
-    defer sockets_b[0].close(io);
     defer sockets_b[1].close(io);
     var hub = Hub.init(testing.allocator, io);
     defer hub.deinit();
@@ -453,9 +463,9 @@ test "Hub: broadcast still delivers to all regardless of channel" {
     const io = threaded.io();
     const sockets_a = try makeSocketPair();
     const sockets_b = try makeSocketPair();
-    defer sockets_a[0].close(io);
+    // Both sockets_a[0] and sockets_b[0] stay registered through the whole
+    // test (broadcast succeeds to both) — see "Hub: add increases count".
     defer sockets_a[1].close(io);
-    defer sockets_b[0].close(io);
     defer sockets_b[1].close(io);
     var hub = Hub.init(testing.allocator, io);
     defer hub.deinit();
@@ -482,28 +492,30 @@ test "Hub: emit serializes JSON with event and data" {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     const sockets = try makeSocketPair();
-    defer sockets[0].close(io);
+    // sockets[0] stays registered in the Hub — see "Hub: add increases count".
     defer sockets[1].close(io);
     var hub = Hub.init(testing.allocator, io);
     defer hub.deinit();
-    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] } });
+    // emit()/broadcastEvent() only sends to .sse-typed connections — without
+    // this, the read below blocks forever waiting for data that never comes.
+    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] }, .type = .sse });
 
     hub.emit("alert", .{ .message = "test", .count = @as(i32, 42) });
 
-    var buf: [256]u8 = undefined;
+    // SSE wire format is plain text ("event: X\ndata: Y\n\n"), not a
+    // length-prefixed WS binary frame — read the exact expected message.
+    const expected = "event: alert\ndata: {\"message\":\"test\",\"count\":42}\n\n";
+    var buf: [expected.len]u8 = undefined;
     var read_buf: [256]u8 = undefined;
     var reader = net.Stream.Reader.init(.{ .socket = sockets[1] }, io, &read_buf);
-    try reader.interface.readSliceAll(buf[0..2]);
-    try testing.expectEqual(@as(u8, 0x81), buf[0]);
-    const payload_len = buf[1];
-    try reader.interface.readSliceAll(buf[0..payload_len]);
-    const payload = buf[0..payload_len];
+    try reader.interface.readSliceAll(&buf);
+    try testing.expectEqualStrings(expected, &buf);
 
+    const data_start = std.mem.indexOf(u8, &buf, "data: ").? + "data: ".len;
+    const payload = buf[data_start .. buf.len - 2]; // trim trailing "\n\n"
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
     defer parsed.deinit();
-    const obj = parsed.value.object;
-    try testing.expectEqualStrings("alert", obj.get("event").?.string);
-    const data_obj = obj.get("data").?.object;
+    const data_obj = parsed.value.object;
     try testing.expectEqualStrings("test", data_obj.get("message").?.string);
     try testing.expectEqual(@as(i64, 42), data_obj.get("count").?.integer);
 }
@@ -513,30 +525,27 @@ test "Hub: emitTo delivers only to matching channel" {
     const io = threaded.io();
     const sockets_a = try makeSocketPair();
     const sockets_b = try makeSocketPair();
-    defer sockets_a[0].close(io);
+    // Both sockets_a[0] (targeted) and sockets_b[0] (never targeted, never
+    // removed) stay registered through the whole test — see "Hub: add
+    // increases count".
     defer sockets_a[1].close(io);
-    defer sockets_b[0].close(io);
     defer sockets_b[1].close(io);
     var hub = Hub.init(testing.allocator, io);
     defer hub.deinit();
 
-    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets_a[0] }, .channel = "room:1" });
-    try hub.add(.{ .id = 2, .stream = .{ .socket = sockets_b[0] }, .channel = "room:2" });
+    // emitTo()/broadcastToChannelEvent() only sends to .sse-typed connections.
+    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets_a[0] }, .channel = "room:1", .type = .sse });
+    try hub.add(.{ .id = 2, .stream = .{ .socket = sockets_b[0] }, .channel = "room:2", .type = .sse });
 
     hub.emitTo("room:1", "notice", .{ .text = "only room:1" });
 
-    var buf: [256]u8 = undefined;
+    // SSE wire format is plain text, not a length-prefixed WS binary frame.
+    const expected = "event: notice\ndata: {\"text\":\"only room:1\"}\n\n";
+    var buf: [expected.len]u8 = undefined;
     var read_buf: [256]u8 = undefined;
     var reader = net.Stream.Reader.init(.{ .socket = sockets_a[1] }, io, &read_buf);
-    try reader.interface.readSliceAll(buf[0..2]);
-    try testing.expectEqual(@as(u8, 0x81), buf[0]);
-    const payload_len = buf[1];
-    try reader.interface.readSliceAll(buf[0..payload_len]);
-    const payload = buf[0..payload_len];
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("notice", parsed.value.object.get("event").?.string);
+    try reader.interface.readSliceAll(&buf);
+    try testing.expectEqualStrings(expected, &buf);
 
     // sockets_b should NOT receive anything — shutdown its send side to confirm
     try (net.Stream{ .socket = sockets_b[0] }).shutdown(io, .send);
@@ -546,27 +555,24 @@ test "Hub: notifyUser delivers to user:42 channel" {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     const sockets = try makeSocketPair();
-    defer sockets[0].close(io);
+    // sockets[0] stays registered in the Hub — see "Hub: add increases count".
     defer sockets[1].close(io);
     var hub = Hub.init(testing.allocator, io);
     defer hub.deinit();
 
-    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] }, .channel = "user:42" });
+    // notifyUser()/emitTo() only sends to .sse-typed connections — without
+    // this, the read below blocks forever waiting for data that never comes.
+    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] }, .channel = "user:42", .type = .sse });
 
     hub.notifyUser(42, "private", .{ .msg = "secret" });
 
-    var buf: [256]u8 = undefined;
+    // SSE wire format is plain text, not a length-prefixed WS binary frame.
+    const expected = "event: private\ndata: {\"msg\":\"secret\"}\n\n";
+    var buf: [expected.len]u8 = undefined;
     var read_buf: [256]u8 = undefined;
     var reader = net.Stream.Reader.init(.{ .socket = sockets[1] }, io, &read_buf);
-    try reader.interface.readSliceAll(buf[0..2]);
-    try testing.expectEqual(@as(u8, 0x81), buf[0]);
-    const payload_len = buf[1];
-    try reader.interface.readSliceAll(buf[0..payload_len]);
-    const payload = buf[0..payload_len];
-
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, payload, .{});
-    defer parsed.deinit();
-    try testing.expectEqualStrings("private", parsed.value.object.get("event").?.string);
+    try reader.interface.readSliceAll(&buf);
+    try testing.expectEqualStrings(expected, &buf);
 }
 
 test "Hub: broadcastToChannel removes dead connection" {
@@ -584,4 +590,60 @@ test "Hub: broadcastToChannel removes dead connection" {
     try (net.Stream{ .socket = sockets[0] }).shutdown(io, .send);
     hub.broadcastToChannel("room:1", "msg");
     try testing.expectEqual(@as(usize, 0), hub.count());
+}
+
+test "Hub: emitTo removes dead connection on write failure" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const sockets = try makeSocketPair();
+    defer sockets[0].close(io);
+    defer sockets[1].close(io);
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+
+    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] }, .channel = "room:1", .type = .sse });
+    try testing.expectEqual(@as(usize, 1), hub.count());
+
+    try (net.Stream{ .socket = sockets[0] }).shutdown(io, .send);
+    hub.emitTo("room:1", "notice", .{ .text = "hi" });
+    try testing.expectEqual(@as(usize, 0), hub.count());
+}
+
+test "Hub: emit (global) removes dead connection on write failure" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const sockets = try makeSocketPair();
+    defer sockets[0].close(io);
+    defer sockets[1].close(io);
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+
+    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] }, .type = .sse });
+    try testing.expectEqual(@as(usize, 1), hub.count());
+
+    try (net.Stream{ .socket = sockets[0] }).shutdown(io, .send);
+    hub.emit("alert", .{ .msg = "hi" });
+    try testing.expectEqual(@as(usize, 0), hub.count());
+}
+
+test "Hub: emit (global) reaches sse connections regardless of channel" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const sockets = try makeSocketPair();
+    // sockets[0] stays registered in the Hub — see "Hub: add increases count".
+    defer sockets[1].close(io);
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+
+    // channel is set but irrelevant to emit() — it's a global broadcast, not
+    // scoped like emitTo(). Only conn.type == .sse is checked (broadcastEvent).
+    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] }, .channel = "room:whatever", .type = .sse });
+
+    hub.emit("alert", .{ .msg = "hi" });
+
+    var buf: [7]u8 = undefined;
+    var read_buf: [256]u8 = undefined;
+    var reader = net.Stream.Reader.init(.{ .socket = sockets[1] }, io, &read_buf);
+    try reader.interface.readSliceAll(&buf);
+    try testing.expectEqualStrings("event: ", &buf);
 }

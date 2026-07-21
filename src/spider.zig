@@ -72,3 +72,26 @@ pub fn deinitWsHub(allocator: std.mem.Allocator) void {
         global_ws_hub = null;
     }
 }
+
+// `zig test`/`b.addTest` only discover `test` blocks written directly in the
+// root file passed to it — NOT transitively through `@import`, even for
+// declarations that are actually used (e.g. `pub const Hub =
+// @import("ws/hub.zig").Hub;` above plucks just the `Hub` type — it doesn't
+// force analysis of hub.zig's sibling `test` blocks). Without this,
+// `zig build test` silently compiled and reported "0 tests passed" while
+// every test block in every other file (hub.zig, sse.zig, multipart.zig,
+// form.zig, push.zig, zmd.zig, template_test.zig — 138 tests total) never
+// ran at all. `refAllDeclsRecursive` doesn't exist in this Zig version, and
+// plain `refAllDecls` only walks one level — same mismatch as above. The
+// fix (same pattern already used in pg_test_root.zig for the pg module):
+// explicitly import each file as a whole container, which forces full
+// analysis of it, including its test blocks.
+test {
+    _ = @import("ws/hub.zig");
+    _ = @import("ws/sse.zig");
+    _ = @import("binding/multipart.zig");
+    _ = @import("binding/form.zig");
+    _ = @import("modules/push.zig");
+    _ = @import("render/zmd/zmd.zig");
+    _ = @import("render/template_test.zig");
+}
