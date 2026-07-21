@@ -164,6 +164,7 @@ fn encryptPayload(
         &ua_public,
         &eph_pub_sec1,
     });
+    defer allocator.free(key_info);
 
     var ikm: [32]u8 = undefined;
     HkdfSha256.expand(&ikm, key_info, prk_key);
@@ -181,7 +182,9 @@ fn encryptPayload(
 
     // 10. Encrypt with AES-128-GCM - append padding delimiter 0x02
     const plaintext = try std.mem.concat(allocator, u8, &.{ payload, &[_]u8{0x02} });
+    defer allocator.free(plaintext);
     const ciphertext = try allocator.alloc(u8, plaintext.len);
+    defer allocator.free(ciphertext);
     var tag: [Aes128Gcm.tag_length]u8 = undefined;
     Aes128Gcm.encrypt(ciphertext, &tag, plaintext, "", nonce, cek);
 
@@ -209,20 +212,25 @@ fn buildVapidJwt(
     try base64urlDecode(&private_key_bytes, config.private_key);
 
     const header_b64 = try base64urlEncode(allocator, "{\"typ\":\"JWT\",\"alg\":\"ES256\"}");
+    defer allocator.free(header_b64);
 
     const exp = timestampSec() + 43200;
     const payload_str = try std.fmt.allocPrint(allocator, "{{\"aud\":\"{s}\",\"exp\":{d},\"sub\":\"{s}\"}}", .{
         audience, exp, config.subject,
     });
+    defer allocator.free(payload_str);
     const payload_b64 = try base64urlEncode(allocator, payload_str);
+    defer allocator.free(payload_b64);
 
     const signing_input = try std.mem.concat(allocator, u8, &.{ header_b64, ".", payload_b64 });
+    defer allocator.free(signing_input);
 
     const secret_key = EcdsaP256Sha256.SecretKey{ .bytes = private_key_bytes };
     const key_pair = try EcdsaP256Sha256.KeyPair.fromSecretKey(secret_key);
     const sig = try key_pair.sign(signing_input, null);
 
     const sig_b64 = try base64urlEncode(allocator, &sig.toBytes());
+    defer allocator.free(sig_b64);
 
     return std.mem.concat(allocator, u8, &.{ header_b64, ".", payload_b64, ".", sig_b64 });
 }
@@ -245,6 +253,7 @@ fn base64urlDecode(dest: []u8, src: []const u8) !void {
 fn extractOrigin(allocator: std.mem.Allocator, url: []const u8) ![]const u8 {
     const uri = try std.Uri.parse(url);
     const port_str = if (uri.port) |p| try std.fmt.allocPrint(allocator, ":{d}", .{p}) else "";
+    defer if (uri.port != null) allocator.free(port_str);
     const host_component = uri.host orelse return error.InvalidUri;
     const host_str = switch (host_component) {
         .raw => |r| r,
