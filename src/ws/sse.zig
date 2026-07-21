@@ -12,6 +12,7 @@ pub const Sse = struct {
     _conn_id: u64,
     channel: []const u8 = "",
     params: std.StringHashMapUnmanaged([]const u8) = .{},
+    headers: std.StringHashMapUnmanaged([]const u8) = .{},
     arena: std.mem.Allocator,
     io: std.Io,
 
@@ -30,9 +31,37 @@ pub const Sse = struct {
         try writer.flush();
     }
 
+    /// Sends "retry: {ms}\n\n" — tells the client's EventSource how long to
+    /// wait before reconnecting after a drop, overriding the browser default
+    /// (~3s, unspecified by the SSE spec, so it varies). Safe to call more
+    /// than once (e.g. to change it mid-connection); the client applies
+    /// whatever the most recently received retry: field said.
+    pub fn setRetry(self: *Sse, ms: u64) !void {
+        var write_buf: [64]u8 = undefined;
+        var sw = net.Stream.Writer.init(self._stream, self.io, &write_buf);
+        const writer = &sw.interface;
+        try writer.print("retry: {d}\n\n", .{ms});
+        try writer.flush();
+    }
+
     pub fn join(self: *Sse, channel: []const u8) !void {
         self.channel = channel;
         try self._hub.updateChannel(self._conn_id, channel);
+    }
+
+    /// join() plus replay: if the client reconnected with a Last-Event-ID
+    /// header, immediately re-sends every event this channel recorded after
+    /// that id (bounded history — see Hub.history_max_entries/_age_ms), so a
+    /// dropped connection doesn't silently miss events between reconnects.
+    /// No-op replay (just a plain join) if there's no Last-Event-ID header
+    /// or nothing newer is in history.
+    pub fn joinWithReplay(self: *Sse, channel: []const u8) !void {
+        try self.join(channel);
+        const last_id = self.lastEventId() orelse return;
+        const entries = try self._hub.historySince(self.arena, channel, last_id);
+        for (entries) |e| {
+            try self.sendRaw(e.id, e.event, e.data);
+        }
     }
 
     pub fn joinUser(self: *Sse, user_id: u64) !void {
@@ -48,6 +77,58 @@ pub const Sse = struct {
 
     pub fn param(self: *Sse, key: []const u8) ?[]const u8 {
         return self.params.get(key);
+    }
+
+    /// Case-insensitive lookup, mirroring Ctx.header() — headers are copied
+    /// into Sse at handshake time (buildHandler), same as .params already is.
+    pub fn header(self: *Sse, name: []const u8) ?[]const u8 {
+        var iter = self.headers.iterator();
+        while (iter.next()) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.key_ptr.*, name)) {
+                return entry.value_ptr.*;
+            }
+        }
+        return null;
+    }
+
+    /// Mirrors Ctx.cookie()'s exact parsing — same Cookie header format.
+    pub fn cookie(self: *Sse, name: []const u8) ?[]const u8 {
+        const cookie_header = self.header("Cookie") orelse return null;
+        var it = std.mem.splitScalar(u8, cookie_header, ';');
+        while (it.next()) |pair| {
+            const trimmed = std.mem.trim(u8, pair, " ");
+            if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq| {
+                const key = std.mem.trim(u8, trimmed[0..eq], " ");
+                if (std.mem.eql(u8, key, name)) {
+                    return std.mem.trim(u8, trimmed[eq + 1 ..], " ");
+                }
+            }
+        }
+        return null;
+    }
+
+    /// The Last-Event-ID header the browser sends automatically on
+    /// reconnect, once it has seen at least one "id:" line — null if absent
+    /// or not a valid integer.
+    pub fn lastEventId(self: *Sse) ?u64 {
+        const raw = self.header("Last-Event-ID") orelse return null;
+        return std.fmt.parseInt(u64, raw, 10) catch null;
+    }
+
+    /// Writes a pre-formatted "id: N\nevent: X\ndata: Y\n\n" frame — used by
+    /// joinWithReplay() to resend history entries verbatim (already-recorded
+    /// event/data strings, not re-serialized).
+    fn sendRaw(self: *Sse, id: u64, event: []const u8, data: []const u8) !void {
+        var write_buf: [4096]u8 = undefined;
+        var sw = net.Stream.Writer.init(self._stream, self.io, &write_buf);
+        const writer = &sw.interface;
+        try writer.print("id: {d}\n", .{id});
+        try writer.writeAll("event: ");
+        try writer.writeAll(event);
+        try writer.writeAll("\ndata: ");
+        try writer.writeAll(data);
+        try writer.writeAll("\n\n");
+        try writer.flush();
     }
 
     pub fn wait(self: *Sse) void {
@@ -96,9 +177,15 @@ pub fn buildHandler(comptime handler: fn (*Sse) anyerror!void) Handler {
                 ._hub = hub,
                 ._conn_id = conn_id,
                 .params = ctx.params,
+                .headers = ctx._headers,
                 .arena = ctx.arena,
                 .io = ctx._io,
             };
+
+            // Sensible default so the browser's EventSource doesn't fall back
+            // to its own unspecified (~3s) reconnect delay; apps can override
+            // via sse.setRetry(ms) before/after this from within `handler`.
+            sse.setRetry(Hub.default_retry_ms) catch {};
 
             handler(&sse) catch {};
             return Response{ .raw = true };
@@ -193,11 +280,14 @@ test "Sse: join updates the connection's channel on the Hub" {
     // emitTo("room:42", ...) must actually reach this connection now.
     hub.emitTo("room:42", "notice", .{ .text = "hi" });
 
-    var buf: [256]u8 = undefined;
+    // emitTo() now prefixes every channel event with "id: N\n" (incrementing
+    // per channel) ahead of "event: ".
+    const expected = "id: 1\nevent: ";
+    var buf: [expected.len]u8 = undefined;
     var read_buf: [256]u8 = undefined;
     var reader = net.Stream.Reader.init(.{ .socket = sockets[1] }, io, &read_buf);
-    try reader.interface.readSliceAll(buf[0..7]); // "event: "
-    try testing.expectEqualStrings("event: ", buf[0..7]);
+    try reader.interface.readSliceAll(&buf);
+    try testing.expectEqualStrings(expected, &buf);
 }
 
 test "Sse: join to a different channel does not receive emitTo on the old one" {
@@ -259,11 +349,14 @@ test "Sse: joinUser joins the 'user:{id}' channel" {
 
     hub.notifyUser(99, "private", .{});
 
-    var buf: [7]u8 = undefined;
+    // notifyUser() routes through emitTo(), which now prefixes every channel
+    // event with "id: N\n" ahead of "event: ".
+    const expected = "id: 1\nevent: ";
+    var buf: [expected.len]u8 = undefined;
     var read_buf: [256]u8 = undefined;
     var reader = net.Stream.Reader.init(.{ .socket = sockets[1] }, io, &read_buf);
     try reader.interface.readSliceAll(&buf);
-    try testing.expectEqualStrings("event: ", &buf);
+    try testing.expectEqualStrings(expected, &buf);
 }
 
 test "Sse: param returns the value for a known key and null for an unknown one" {
@@ -291,17 +384,9 @@ test "Sse: param returns the value for a known key and null for an unknown one" 
     try testing.expectEqual(@as(?[]const u8, null), sse.param("condo_id"));
 }
 
-// ── TDD spec: NOT-YET-IMPLEMENTED "id:" field ───────────────────────────────
-// One planned feature (per-event `id:` line + Last-Event-ID replay support)
-// is partially expressible today: the *sending* half (an incrementing id:
-// line on every event) only needs the existing public API — no new fields
-// needed to write the assertion, unlike heartbeat/retry/header access/replay
-// itself, which all need new API surface that doesn't exist yet (see
-// SSE_HUB_TEST_NOTES.md for those). This test is expected to FAIL against
-// the current implementation — sendSse() never writes an id: line — and
-// should start passing once that lands.
+// ── id: field (was the TDD red spec, now implemented in Hub.emitTo) ────────
 
-test "Sse (SPEC, currently failing): emitTo includes an incrementing id: line" {
+test "Sse: emitTo includes an incrementing id: line" {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     const sockets = try makeSocketPair();
@@ -319,7 +404,6 @@ test "Sse (SPEC, currently failing): emitTo includes an incrementing id: line" {
     var read_buf: [256]u8 = undefined;
     var reader = net.Stream.Reader.init(.{ .socket = sockets[1] }, io, &read_buf);
 
-    // Expected future wire format per event: "id: 1\nevent: notice\ndata: ...\n\n"
     const expected_first = "id: 1\nevent: notice\ndata: {\"text\":\"first\"}\n\n";
     try reader.interface.readSliceAll(buf[0..expected_first.len]);
     try testing.expectEqualStrings(expected_first, buf[0..expected_first.len]);
@@ -327,4 +411,203 @@ test "Sse (SPEC, currently failing): emitTo includes an incrementing id: line" {
     const expected_second = "id: 2\nevent: notice\ndata: {\"text\":\"second\"}\n\n";
     try reader.interface.readSliceAll(buf[0..expected_second.len]);
     try testing.expectEqualStrings(expected_second, buf[0..expected_second.len]);
+}
+
+// ── retry: field ─────────────────────────────────────────────────────────
+
+test "Sse: setRetry writes a retry: line" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const sockets = try makeSocketPair();
+    defer sockets[0].close(io);
+    defer sockets[1].close(io);
+
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var sse = Sse{
+        ._stream = .{ .socket = sockets[0] },
+        ._hub = &hub,
+        ._conn_id = 1,
+        .arena = arena.allocator(),
+        .io = io,
+    };
+
+    try sse.setRetry(5000);
+
+    const expected = "retry: 5000\n\n";
+    var buf: [expected.len]u8 = undefined;
+    var read_buf: [256]u8 = undefined;
+    var reader = net.Stream.Reader.init(.{ .socket = sockets[1] }, io, &read_buf);
+    try reader.interface.readSliceAll(&buf);
+    try testing.expectEqualStrings(expected, &buf);
+}
+
+// ── Headers / cookies ────────────────────────────────────────────────────
+
+fn testSseWithHeaders(hub: *Hub, arena: std.mem.Allocator, io: std.Io, pairs: []const [2][]const u8) !Sse {
+    var headers: std.StringHashMapUnmanaged([]const u8) = .{};
+    for (pairs) |p| try headers.put(arena, p[0], p[1]);
+    return Sse{
+        ._stream = undefined,
+        ._hub = hub,
+        ._conn_id = 1,
+        .headers = headers,
+        .arena = arena,
+        .io = io,
+    };
+}
+
+test "Sse: header is case-insensitive and returns null for unknown names" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+
+    var sse = try testSseWithHeaders(&hub, arena.allocator(), io, &.{
+        .{ "Last-Event-ID", "42" },
+    });
+
+    try testing.expectEqualStrings("42", sse.header("last-event-id").?);
+    try testing.expectEqualStrings("42", sse.header("Last-Event-ID").?);
+    try testing.expectEqual(@as(?[]const u8, null), sse.header("X-Missing"));
+}
+
+test "Sse: cookie parses the Cookie header, mirroring Ctx.cookie()" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+
+    var sse = try testSseWithHeaders(&hub, arena.allocator(), io, &.{
+        .{ "Cookie", "orbitx_condo=abc; session=xyz" },
+    });
+
+    try testing.expectEqualStrings("abc", sse.cookie("orbitx_condo").?);
+    try testing.expectEqualStrings("xyz", sse.cookie("session").?);
+    try testing.expectEqual(@as(?[]const u8, null), sse.cookie("missing"));
+}
+
+test "Sse: cookie returns null when there is no Cookie header at all" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+
+    var sse = try testSseWithHeaders(&hub, arena.allocator(), io, &.{});
+    try testing.expectEqual(@as(?[]const u8, null), sse.cookie("anything"));
+}
+
+test "Sse: lastEventId parses Last-Event-ID as an integer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+
+    var sse = try testSseWithHeaders(&hub, arena.allocator(), io, &.{
+        .{ "Last-Event-ID", "7" },
+    });
+    try testing.expectEqual(@as(?u64, 7), sse.lastEventId());
+}
+
+test "Sse: lastEventId is null when the header is missing or not a number" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+
+    var missing = try testSseWithHeaders(&hub, arena.allocator(), io, &.{});
+    try testing.expectEqual(@as(?u64, null), missing.lastEventId());
+
+    var invalid = try testSseWithHeaders(&hub, arena.allocator(), io, &.{
+        .{ "Last-Event-ID", "not-a-number" },
+    });
+    try testing.expectEqual(@as(?u64, null), invalid.lastEventId());
+}
+
+// ── joinWithReplay (Last-Event-ID replay) ───────────────────────────────
+
+test "Sse: joinWithReplay resends only events missed since Last-Event-ID" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+
+    // Two events happen on the channel before this connection ever joins —
+    // as if a previous connection on the same channel had already seen id 1.
+    hub.emitTo("room:1", "a", .{ .n = 1 });
+    hub.emitTo("room:1", "b", .{ .n = 2 });
+
+    const sockets = try makeSocketPair();
+    // sockets[0] becomes Hub-registered inside joinWithReplay -> join() below.
+    defer sockets[1].close(io);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var headers: std.StringHashMapUnmanaged([]const u8) = .{};
+    try headers.put(arena.allocator(), "Last-Event-ID", "1");
+
+    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] }, .type = .sse });
+    var sse = Sse{
+        ._stream = .{ .socket = sockets[0] },
+        ._hub = &hub,
+        ._conn_id = 1,
+        .headers = headers,
+        .arena = arena.allocator(),
+        .io = io,
+    };
+
+    try sse.joinWithReplay("room:1");
+
+    // Only event "b" (id 2) should have been replayed — id 1 is already
+    // known to the client per its own Last-Event-ID.
+    const expected = "id: 2\nevent: b\ndata: {\"n\":2}\n\n";
+    var buf: [expected.len]u8 = undefined;
+    var read_buf: [256]u8 = undefined;
+    var reader = net.Stream.Reader.init(.{ .socket = sockets[1] }, io, &read_buf);
+    try reader.interface.readSliceAll(&buf);
+    try testing.expectEqualStrings(expected, &buf);
+}
+
+test "Sse: joinWithReplay without a Last-Event-ID header just joins, no replay" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+
+    hub.emitTo("room:1", "a", .{ .n = 1 });
+
+    const sockets = try makeSocketPair();
+    // sockets[0] becomes Hub-registered below — see "Hub: add increases
+    // count" in hub.zig for why it must not also get its own defer close.
+    defer sockets[1].close(io);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] }, .type = .sse });
+    var sse = Sse{
+        ._stream = .{ .socket = sockets[0] },
+        ._hub = &hub,
+        ._conn_id = 1,
+        .arena = arena.allocator(),
+        .io = io,
+    };
+
+    try sse.joinWithReplay("room:1");
+    try testing.expectEqualStrings("room:1", sse.channel);
+
+    // Nothing should have been sent — confirm without blocking forever.
+    try (net.Stream{ .socket = sockets[0] }).shutdown(io, .send);
 }

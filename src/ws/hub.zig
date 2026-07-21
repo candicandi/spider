@@ -7,6 +7,19 @@ pub const Hub = struct {
     io: std.Io,
     mutex: std.Io.Mutex,
     connections: std.ArrayListUnmanaged(Connection) = .empty,
+    channel_history: std.StringHashMapUnmanaged(ChannelHistory) = .empty,
+
+    heartbeat_thread: ?std.Thread = null,
+    heartbeat_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    sweep_thread: ?std.Thread = null,
+    sweep_running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    pub const default_heartbeat_ms: u64 = 30_000;
+    pub const default_sweep_ms: u64 = 60_000;
+    pub const default_retry_ms: u64 = 3_000;
+    /// Per-channel replay buffer bound — whichever limit is hit first.
+    const history_max_entries: usize = 50;
+    const history_max_age_ms: i64 = 5 * 60 * 1000;
 
     pub const Connection = struct {
         id: u64,
@@ -14,6 +27,27 @@ pub const Hub = struct {
         channel: []const u8 = "",
         namespace: []const u8 = "",
         type: enum { ws, sse } = .ws,
+        last_activity: ?std.Io.Timestamp = null,
+    };
+
+    pub const HistoryEntry = struct {
+        id: u64,
+        event: []const u8,
+        data: []const u8,
+        timestamp: std.Io.Timestamp,
+    };
+
+    const ChannelHistory = struct {
+        next_id: u64 = 1,
+        entries: std.ArrayListUnmanaged(HistoryEntry) = .empty,
+
+        fn deinit(self: *ChannelHistory, allocator: std.mem.Allocator) void {
+            for (self.entries.items) |e| {
+                allocator.free(e.event);
+                allocator.free(e.data);
+            }
+            self.entries.deinit(allocator);
+        }
     };
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Hub {
@@ -26,10 +60,20 @@ pub const Hub = struct {
     }
 
     pub fn deinit(self: *Hub) void {
+        self.stopHeartbeat();
+        self.stopSweep();
+
         for (self.connections.items) |conn| {
             conn.stream.close(self.io);
         }
         self.connections.deinit(self.allocator);
+
+        var it = self.channel_history.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.channel_history.deinit(self.allocator);
     }
 
     pub fn add(self: *Hub, conn: Connection) !void {
@@ -38,7 +82,9 @@ pub const Hub = struct {
         for (self.connections.items) |c| {
             if (c.id == conn.id) return error.DuplicateId;
         }
-        try self.connections.append(self.allocator, conn);
+        var c = conn;
+        c.last_activity = self.now();
+        try self.connections.append(self.allocator, c);
     }
 
     pub fn updateChannel(self: *Hub, conn_id: u64, channel: []const u8) !void {
@@ -120,7 +166,74 @@ pub const Hub = struct {
     pub fn emitTo(self: *Hub, channel: []const u8, event: []const u8, data: anytype) void {
         const json = std.json.Stringify.valueAlloc(self.allocator, data, .{}) catch return;
         defer self.allocator.free(json);
-        self.broadcastToChannelEvent(channel, event, json);
+        const id = self.recordHistory(channel, event, json) catch return;
+        self.broadcastToChannelEvent(channel, id, event, json);
+    }
+
+    /// Assigns the next id for `channel` (per-channel counter) and appends
+    /// the event to its replay buffer, pruning anything past
+    /// history_max_entries or history_max_age_ms. Only emitTo()/notifyUser()
+    /// go through here — emit()/broadcast() aren't channel-scoped, so there's
+    /// no natural history bucket for them, and Sse.send() is a raw one-off
+    /// write to a single connection, not routed through the Hub at all.
+    fn recordHistory(self: *Hub, channel: []const u8, event: []const u8, data: []const u8) !u64 {
+        self.mutex.lock(self.io) catch return error.LockFailed;
+        defer self.mutex.unlock(self.io);
+
+        const gop = try self.channel_history.getOrPut(self.allocator, channel);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.allocator.dupe(u8, channel);
+            gop.value_ptr.* = .{};
+        }
+        const hist = gop.value_ptr;
+        const id = hist.next_id;
+        hist.next_id += 1;
+
+        const ts = self.now();
+        try hist.entries.append(self.allocator, .{
+            .id = id,
+            .event = try self.allocator.dupe(u8, event),
+            .data = try self.allocator.dupe(u8, data),
+            .timestamp = ts,
+        });
+
+        while (hist.entries.items.len > history_max_entries) {
+            const old = hist.entries.orderedRemove(0);
+            self.allocator.free(old.event);
+            self.allocator.free(old.data);
+        }
+        while (hist.entries.items.len > 0 and
+            hist.entries.items[0].timestamp.durationTo(ts).toMilliseconds() > history_max_age_ms)
+        {
+            const old = hist.entries.orderedRemove(0);
+            self.allocator.free(old.event);
+            self.allocator.free(old.data);
+        }
+
+        return id;
+    }
+
+    /// Copies (caller-owned via `allocator`) every history entry recorded
+    /// for `channel` with id > last_id, in order — what Sse.joinWithReplay()
+    /// sends on reconnect. Empty slice if the channel has no history or
+    /// last_id is already caught up.
+    pub fn historySince(self: *Hub, allocator: std.mem.Allocator, channel: []const u8, last_id: u64) ![]HistoryEntry {
+        self.mutex.lock(self.io) catch return error.LockFailed;
+        defer self.mutex.unlock(self.io);
+
+        const hist = self.channel_history.getPtr(channel) orelse return &.{};
+        var out: std.ArrayListUnmanaged(HistoryEntry) = .empty;
+        for (hist.entries.items) |e| {
+            if (e.id > last_id) {
+                try out.append(allocator, .{
+                    .id = e.id,
+                    .event = try allocator.dupe(u8, e.event),
+                    .data = try allocator.dupe(u8, e.data),
+                    .timestamp = e.timestamp,
+                });
+            }
+        }
+        return out.toOwnedSlice(allocator);
     }
 
     fn broadcastEvent(self: *Hub, event: []const u8, data: []const u8) void {
@@ -156,7 +269,7 @@ pub const Hub = struct {
         }
     }
 
-    fn broadcastToChannelEvent(self: *Hub, channel: []const u8, event: []const u8, data: []const u8) void {
+    fn broadcastToChannelEvent(self: *Hub, channel: []const u8, id: u64, event: []const u8, data: []const u8) void {
         self.mutex.lock(self.io) catch return;
         var snapshot: std.ArrayListUnmanaged(Connection) = .empty;
         defer snapshot.deinit(self.allocator);
@@ -171,7 +284,7 @@ pub const Hub = struct {
         defer dead.deinit(self.allocator);
 
         for (snapshot.items) |conn| {
-            self.sendSse(conn.stream, event, data) catch {
+            self.sendSseWithId(conn.stream, id, event, data) catch {
                 dead.append(self.allocator, conn.id) catch {};
             };
         }
@@ -179,9 +292,9 @@ pub const Hub = struct {
         if (dead.items.len == 0) return;
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
-        for (dead.items) |id| {
+        for (dead.items) |dead_id| {
             for (self.connections.items, 0..) |conn, i| {
-                if (conn.id == id) {
+                if (conn.id == dead_id) {
                     _ = self.connections.orderedRemove(i);
                     break;
                 }
@@ -251,6 +364,34 @@ pub const Hub = struct {
         try writer.flush();
     }
 
+    fn sendSseWithId(self: *Hub, stream: net.Stream, id: u64, event: []const u8, data: []const u8) !void {
+        var write_buf: [4096]u8 = undefined;
+        var sw = net.Stream.Writer.init(stream, self.io, &write_buf);
+        const writer = &sw.interface;
+        try writer.print("id: {d}\n", .{id});
+        try writer.writeAll("event: ");
+        try writer.writeAll(event);
+        try writer.writeAll("\ndata: ");
+        try writer.writeAll(data);
+        try writer.writeAll("\n\n");
+        try writer.flush();
+    }
+
+    /// SSE comment line (leading ':') — spec-valid content the client's
+    /// EventSource silently ignores as an event, but the bytes on the wire
+    /// keep the TCP connection "hot" against idle-timeout proxies/LBs, and a
+    /// write failure here is exactly as good a dead-connection signal as a
+    /// real event would be.
+    fn sendSseComment(self: *Hub, stream: net.Stream, comment: []const u8) !void {
+        var write_buf: [128]u8 = undefined;
+        var sw = net.Stream.Writer.init(stream, self.io, &write_buf);
+        const writer = &sw.interface;
+        try writer.writeAll(": ");
+        try writer.writeAll(comment);
+        try writer.writeAll("\n\n");
+        try writer.flush();
+    }
+
     fn sendText(self: *Hub, stream: net.Stream, text: []const u8) !void {
         var write_buf: [4096]u8 = undefined;
         var sw = net.Stream.Writer.init(stream, self.io, &write_buf);
@@ -275,6 +416,164 @@ pub const Hub = struct {
         try writer.writeAll(header_buf[0..header_len]);
         try writer.writeAll(text);
         try writer.flush();
+    }
+
+    fn pruneDead(self: *Hub, dead_ids: []const u64) void {
+        if (dead_ids.len == 0) return;
+        self.mutex.lock(self.io) catch return;
+        defer self.mutex.unlock(self.io);
+        for (dead_ids) |id| {
+            for (self.connections.items, 0..) |conn, i| {
+                if (conn.id == id) {
+                    _ = self.connections.orderedRemove(i);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn touchActivity(self: *Hub, touched_ids: []const u64, ts: std.Io.Timestamp) void {
+        if (touched_ids.len == 0) return;
+        self.mutex.lock(self.io) catch return;
+        defer self.mutex.unlock(self.io);
+        for (touched_ids) |id| {
+            for (self.connections.items) |*conn| {
+                if (conn.id == id) {
+                    conn.last_activity = ts;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn now(self: *Hub) std.Io.Timestamp {
+        return std.Io.Clock.awake.now(self.io);
+    }
+
+    // ─── Heartbeat ───────────────────────────────────────────────────
+    // Periodic ": heartbeat\n\n" to every SSE connection, keeping the TCP
+    // connection active against idle-timeout proxies/load balancers/mobile
+    // carrier NATs — without it, a channel that goes quiet for a while can
+    // get silently dropped mid-connection with neither side noticing until
+    // the next real write fails. Opt-in (call startHeartbeat after init())
+    // so existing callers/tests that never touch it are unaffected.
+
+    pub fn startHeartbeat(self: *Hub, interval_ms: ?u64) !void {
+        if (self.heartbeat_thread != null) return;
+        self.heartbeat_running.store(true, .release);
+        self.heartbeat_thread = try std.Thread.spawn(.{}, heartbeatLoop, .{ self, interval_ms orelse default_heartbeat_ms });
+    }
+
+    pub fn stopHeartbeat(self: *Hub) void {
+        if (self.heartbeat_thread) |t| {
+            self.heartbeat_running.store(false, .release);
+            t.join();
+            self.heartbeat_thread = null;
+        }
+    }
+
+    fn heartbeatLoop(self: *Hub, interval_ms: u64) void {
+        while (self.heartbeat_running.load(.acquire)) {
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(@intCast(interval_ms)), .real) catch {};
+            if (self.heartbeat_running.load(.acquire)) {
+                self.sendHeartbeats();
+            }
+        }
+    }
+
+    /// The actual per-tick heartbeat action, callable directly (deterministic,
+    /// no timer involved) — this is what startHeartbeat's background thread
+    /// calls on each tick, and what tests exercise instead of racing a timer.
+    pub fn sendHeartbeats(self: *Hub) void {
+        self.mutex.lock(self.io) catch return;
+        var snapshot: std.ArrayListUnmanaged(Connection) = .empty;
+        defer snapshot.deinit(self.allocator);
+        for (self.connections.items) |conn| {
+            if (conn.type == .sse) snapshot.append(self.allocator, conn) catch {};
+        }
+        self.mutex.unlock(self.io);
+
+        const ts = self.now();
+        var dead: std.ArrayListUnmanaged(u64) = .empty;
+        defer dead.deinit(self.allocator);
+        var touched: std.ArrayListUnmanaged(u64) = .empty;
+        defer touched.deinit(self.allocator);
+
+        for (snapshot.items) |conn| {
+            if (self.sendSseComment(conn.stream, "heartbeat")) |_| {
+                touched.append(self.allocator, conn.id) catch {};
+            } else |_| {
+                dead.append(self.allocator, conn.id) catch {};
+            }
+        }
+
+        self.pruneDead(dead.items);
+        self.touchActivity(touched.items, ts);
+    }
+
+    // ─── Proactive dead-connection sweep ────────────────────────────────
+    // Heartbeat/emit/broadcast only ever discover a dead connection
+    // reactively, on the next write attempt — a channel nobody emits to and
+    // that never gets a heartbeat can accumulate zombie connections
+    // indefinitely. Sweep independently probes any SSE connection that's
+    // been idle for at least the sweep interval and removes ones that fail.
+
+    pub fn startSweep(self: *Hub, interval_ms: ?u64) !void {
+        if (self.sweep_thread != null) return;
+        self.sweep_running.store(true, .release);
+        self.sweep_thread = try std.Thread.spawn(.{}, sweepLoop, .{ self, interval_ms orelse default_sweep_ms });
+    }
+
+    pub fn stopSweep(self: *Hub) void {
+        if (self.sweep_thread) |t| {
+            self.sweep_running.store(false, .release);
+            t.join();
+            self.sweep_thread = null;
+        }
+    }
+
+    fn sweepLoop(self: *Hub, interval_ms: u64) void {
+        while (self.sweep_running.load(.acquire)) {
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(@intCast(interval_ms)), .real) catch {};
+            if (self.sweep_running.load(.acquire)) {
+                self.sweepDeadConnections(interval_ms);
+            }
+        }
+    }
+
+    /// Directly callable (deterministic, no timer) — probes any SSE
+    /// connection idle for at least `idle_threshold_ms` and removes the ones
+    /// that fail to receive it.
+    pub fn sweepDeadConnections(self: *Hub, idle_threshold_ms: u64) void {
+        const ts = self.now();
+        self.mutex.lock(self.io) catch return;
+        var snapshot: std.ArrayListUnmanaged(Connection) = .empty;
+        defer snapshot.deinit(self.allocator);
+        for (self.connections.items) |conn| {
+            // No last_activity yet (never touched since add()) counts as
+            // idle — always eligible for the first sweep pass.
+            const idle_ms = if (conn.last_activity) |la| la.durationTo(ts).toMilliseconds() else std.math.maxInt(i64);
+            if (conn.type == .sse and idle_ms >= @as(i64, @intCast(idle_threshold_ms))) {
+                snapshot.append(self.allocator, conn) catch {};
+            }
+        }
+        self.mutex.unlock(self.io);
+
+        var dead: std.ArrayListUnmanaged(u64) = .empty;
+        defer dead.deinit(self.allocator);
+        var touched: std.ArrayListUnmanaged(u64) = .empty;
+        defer touched.deinit(self.allocator);
+
+        for (snapshot.items) |conn| {
+            if (self.sendSseComment(conn.stream, "ping")) |_| {
+                touched.append(self.allocator, conn.id) catch {};
+            } else |_| {
+                dead.append(self.allocator, conn.id) catch {};
+            }
+        }
+
+        self.pruneDead(dead.items);
+        self.touchActivity(touched.items, ts);
     }
 };
 
@@ -540,7 +839,7 @@ test "Hub: emitTo delivers only to matching channel" {
     hub.emitTo("room:1", "notice", .{ .text = "only room:1" });
 
     // SSE wire format is plain text, not a length-prefixed WS binary frame.
-    const expected = "event: notice\ndata: {\"text\":\"only room:1\"}\n\n";
+    const expected = "id: 1\nevent: notice\ndata: {\"text\":\"only room:1\"}\n\n";
     var buf: [expected.len]u8 = undefined;
     var read_buf: [256]u8 = undefined;
     var reader = net.Stream.Reader.init(.{ .socket = sockets_a[1] }, io, &read_buf);
@@ -567,7 +866,7 @@ test "Hub: notifyUser delivers to user:42 channel" {
     hub.notifyUser(42, "private", .{ .msg = "secret" });
 
     // SSE wire format is plain text, not a length-prefixed WS binary frame.
-    const expected = "event: private\ndata: {\"msg\":\"secret\"}\n\n";
+    const expected = "id: 1\nevent: private\ndata: {\"msg\":\"secret\"}\n\n";
     var buf: [expected.len]u8 = undefined;
     var read_buf: [256]u8 = undefined;
     var reader = net.Stream.Reader.init(.{ .socket = sockets[1] }, io, &read_buf);
@@ -646,4 +945,194 @@ test "Hub: emit (global) reaches sse connections regardless of channel" {
     var reader = net.Stream.Reader.init(.{ .socket = sockets[1] }, io, &read_buf);
     try reader.interface.readSliceAll(&buf);
     try testing.expectEqualStrings("event: ", &buf);
+}
+
+// ── Heartbeat ───────────────────────────────────────────────────────────
+// Tests call sendHeartbeats()/sweepDeadConnections() directly rather than
+// going through startHeartbeat()/startSweep() — deterministic, no racing a
+// background thread against a fixed test timeout.
+
+test "Hub: sendHeartbeats writes an SSE comment to sse connections" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const sockets = try makeSocketPair();
+    defer sockets[1].close(io);
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] }, .type = .sse });
+
+    hub.sendHeartbeats();
+
+    const expected = ": heartbeat\n\n";
+    var buf: [expected.len]u8 = undefined;
+    var read_buf: [256]u8 = undefined;
+    var reader = net.Stream.Reader.init(.{ .socket = sockets[1] }, io, &read_buf);
+    try reader.interface.readSliceAll(&buf);
+    try testing.expectEqualStrings(expected, &buf);
+}
+
+test "Hub: sendHeartbeats does not write to ws connections" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const sockets = try makeSocketPair();
+    defer sockets[1].close(io);
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] }, .type = .ws });
+
+    hub.sendHeartbeats();
+
+    // Nothing should arrive — shutdown the send side to confirm, matching
+    // the pattern used by "delivers only to matching channel" tests above.
+    try (net.Stream{ .socket = sockets[0] }).shutdown(io, .send);
+}
+
+test "Hub: sendHeartbeats removes a dead sse connection" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const sockets = try makeSocketPair();
+    defer sockets[1].close(io);
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] }, .type = .sse });
+    try testing.expectEqual(@as(usize, 1), hub.count());
+
+    try (net.Stream{ .socket = sockets[0] }).shutdown(io, .send);
+    hub.sendHeartbeats();
+    try testing.expectEqual(@as(usize, 0), hub.count());
+}
+
+// ── Proactive sweep ─────────────────────────────────────────────────────
+
+test "Hub: sweepDeadConnections pings a never-active sse connection" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const sockets = try makeSocketPair();
+    defer sockets[1].close(io);
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] }, .type = .sse });
+
+    // idle_threshold_ms=0 — every connection (just added, last_activity set
+    // by add()) already qualifies as "idle for at least 0ms".
+    hub.sweepDeadConnections(0);
+
+    const expected = ": ping\n\n";
+    var buf: [expected.len]u8 = undefined;
+    var read_buf: [256]u8 = undefined;
+    var reader = net.Stream.Reader.init(.{ .socket = sockets[1] }, io, &read_buf);
+    try reader.interface.readSliceAll(&buf);
+    try testing.expectEqualStrings(expected, &buf);
+}
+
+test "Hub: sweepDeadConnections skips a connection under the idle threshold" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const sockets = try makeSocketPair();
+    // sockets[0] stays registered in the Hub — see "Hub: add increases count".
+    defer sockets[1].close(io);
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] }, .type = .sse });
+
+    // Just added (last_activity ~= now) — an hour-long idle threshold means
+    // this connection is nowhere close to eligible, so nothing gets sent.
+    hub.sweepDeadConnections(60 * 60 * 1000);
+
+    // Confirm nothing arrived without blocking forever waiting for it.
+    try (net.Stream{ .socket = sockets[0] }).shutdown(io, .send);
+}
+
+test "Hub: sweepDeadConnections removes a dead sse connection" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    const sockets = try makeSocketPair();
+    defer sockets[1].close(io);
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+    try hub.add(.{ .id = 1, .stream = .{ .socket = sockets[0] }, .type = .sse });
+    try testing.expectEqual(@as(usize, 1), hub.count());
+
+    try (net.Stream{ .socket = sockets[0] }).shutdown(io, .send);
+    hub.sweepDeadConnections(0);
+    try testing.expectEqual(@as(usize, 0), hub.count());
+}
+
+// ── Replay buffer (Last-Event-ID) ───────────────────────────────────────
+
+test "Hub: historySince returns only entries after last_id, in order" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+
+    // No connections needed — emitTo() records history even with nobody
+    // subscribed yet (json alloc/free still happens, just nothing to send to).
+    hub.emitTo("room:1", "a", .{ .n = 1 });
+    hub.emitTo("room:1", "b", .{ .n = 2 });
+    hub.emitTo("room:1", "c", .{ .n = 3 });
+
+    const entries = try hub.historySince(testing.allocator, "room:1", 1);
+    defer {
+        for (entries) |e| {
+            testing.allocator.free(e.event);
+            testing.allocator.free(e.data);
+        }
+        testing.allocator.free(entries);
+    }
+
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqual(@as(u64, 2), entries[0].id);
+    try testing.expectEqualStrings("b", entries[0].event);
+    try testing.expectEqual(@as(u64, 3), entries[1].id);
+    try testing.expectEqualStrings("c", entries[1].event);
+}
+
+test "Hub: historySince with last_id caught up to the newest entry returns empty" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+
+    hub.emitTo("room:1", "a", .{});
+
+    const entries = try hub.historySince(testing.allocator, "room:1", 1);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "Hub: historySince on a channel with no history returns empty" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+
+    const entries = try hub.historySince(testing.allocator, "never:emitted", 0);
+    defer testing.allocator.free(entries);
+    try testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "Hub: recordHistory prunes past history_max_entries" {
+    var threaded = std.Io.Threaded.init_single_threaded;
+    const io = threaded.io();
+    var hub = Hub.init(testing.allocator, io);
+    defer hub.deinit();
+
+    var i: usize = 0;
+    while (i < 55) : (i += 1) {
+        hub.emitTo("room:prune", "e", .{ .n = i });
+    }
+
+    const entries = try hub.historySince(testing.allocator, "room:prune", 0);
+    defer {
+        for (entries) |e| {
+            testing.allocator.free(e.event);
+            testing.allocator.free(e.data);
+        }
+        testing.allocator.free(entries);
+    }
+    // 55 emitted, cap is 50 — oldest 5 (ids 1..5) pruned, newest 50 remain.
+    try testing.expectEqual(@as(usize, 50), entries.len);
+    try testing.expectEqual(@as(u64, 6), entries[0].id);
+    try testing.expectEqual(@as(u64, 55), entries[entries.len - 1].id);
 }
