@@ -813,6 +813,28 @@ pub fn Server(comptime T: type) type {
             return self;
         }
 
+        /// Starts the shared SSE hub's heartbeat (": heartbeat\n\n" on every
+        /// interval, keeping connections warm against idle-timeout
+        /// proxies/LBs). `interval_ms` null uses Hub.default_heartbeat_ms
+        /// (30s). Best-effort — spawn failure is rare (thread/OOM limits)
+        /// and not worth failing server startup over, matching sseInterval's
+        /// own `catch {}` above.
+        pub fn sseHeartbeat(self: *Self, interval_ms: ?u64) *Self {
+            self.ensureSseHub();
+            if (self.sse_hub) |*hub| hub.startHeartbeat(interval_ms) catch {};
+            return self;
+        }
+
+        /// Starts the shared SSE hub's proactive dead-connection sweep —
+        /// independent of sseHeartbeat, so a channel that's both quiet and
+        /// never emitted to doesn't accumulate zombie connections
+        /// indefinitely. `interval_ms` null uses Hub.default_sweep_ms (60s).
+        pub fn sseSweep(self: *Self, interval_ms: ?u64) *Self {
+            self.ensureSseHub();
+            if (self.sse_hub) |*hub| hub.startSweep(interval_ms) catch {};
+            return self;
+        }
+
         pub fn sse(self: *Self, path: []const u8, comptime handler: fn (*Sse) anyerror!void) *Self {
             self.ensureSseHub();
             const H = sse_mod.buildHandler(handler);
