@@ -44,9 +44,22 @@ pub fn build(b: *std.Build) void {
     if (io_backend == .zio) {
         // Not lazy anymore (see build.zig.zon) — b.dependency() is
         // guaranteed already-fetched, no optional to unwrap.
+        //
+        // Forces epoll instead of zio's own Linux default (io_uring):
+        // io_uring_setup() came back EPERM under Docker's default seccomp
+        // profile (io_uring syscalls aren't in its allowlist — a
+        // well-known restriction, io_uring has a heavy CVE history).
+        // Confirmed via a minimal zio-only reproduction (github.com/
+        // llllOllOOll/spider tree, see zio_app scratch project) deployed
+        // to the same VPS/Docker setup as production: crashed within
+        // seconds with io_uring (default), ran clean with
+        // -Dbackend=epoll forced. epoll is supported by every Linux
+        // seccomp profile in practice, at the cost of io_uring's lower
+        // per-syscall overhead — not a concern at this app's scale.
         const zio_dep = b.dependency("zio", .{
             .target = target,
             .optimize = optimize,
+            .backend = @as(?[]const u8, "epoll"),
         });
         mod.addImport("zio", zio_dep.module("zio"));
     }
