@@ -42,10 +42,12 @@ pub fn build(b: *std.Build) void {
     });
 
     if (io_backend == .zio) {
-        const zio_dep = b.lazyDependency("zio", .{
+        // Not lazy anymore (see build.zig.zon) — b.dependency() is
+        // guaranteed already-fetched, no optional to unwrap.
+        const zio_dep = b.dependency("zio", .{
             .target = target,
             .optimize = optimize,
-        }) orelse unreachable;
+        });
         mod.addImport("zio", zio_dep.module("zio"));
     }
 

@@ -8,10 +8,21 @@
             .url = "git+https://github.com/llllOllOOll/pacman#6e0074ddba77311dacd61fb342a25c5b93112583",
             .hash = "pacman-0.1.0-SPnstR0NAQCXI7e12b6ngxaJWIs7-PpfZeLCUbzr1pEZ",
         },
+        // Not lazy: a lazy dependency of a dependency is only fetched if
+        // the ROOT project's own build.zig.zon also lists it (Zig's fetch
+        // phase only follows lazy edges reachable from the root
+        // manifest), and even then the first `zig build` invocation with
+        // a cold cache must return null gracefully from lazyDependency()
+        // for the automatic fetch-and-rerun to kick in — a broken
+        // production deploy (empty build cache, single `zig build`
+        // invocation) is what happens when that two-pass dance isn't
+        // handled just right. Since io_backend defaults to .zio, this is
+        // fetched on effectively every build anyway; making it eager
+        // avoids that whole class of problem for one extra unconditional
+        // fetch on `.threaded`-only builds.
         .zio = .{
             .url = "git+https://github.com/lalinsky/zio?ref=zig-0.17#316161e6da288c0f0432709767aa2f02ba00ecce",
             .hash = "zio-0.13.0-xHbVVIxtHQD1mhkK4SSuEtoPdJiFj5keaBqAMBxuLJbm",
-            .lazy = true,
         },
         .pg = .{
             .path = "modules/pg/pg_driver_impl",
