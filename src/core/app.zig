@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const build_options = @import("spider_build_options");
 const env = @import("../internal/env.zig");
 const static_mod = @import("../modules/static.zig");
 pub const StaticConfig = static_mod.StaticConfig;
@@ -463,7 +464,6 @@ fn buildWsWrapper(comptime handler: fn (*Ws) anyerror!void) Handler {
     return W.call;
 }
 
-
 const IntervalEntry = struct {
     hub: *Hub,
     ms: u64,
@@ -913,6 +913,16 @@ pub fn Server(comptime T: type) type {
         }
 
         pub fn listen(self: *Self, options: ListenOptions) !void {
+            if (comptime build_options.io_backend == .zio) {
+                return self.listenZio(options);
+            }
+            return self.listenThreaded(options);
+        }
+
+        /// Default backend. One `Io.Threaded` pool shared by every worker
+        /// thread; each of the `cpu_count` threads below runs its own
+        /// `accept()` loop directly against the listener socket.
+        fn listenThreaded(self: *Self, options: ListenOptions) !void {
             const port = options.port orelse self.config.port;
             const host = options.host orelse self.config.host;
 
@@ -966,6 +976,59 @@ pub fn Server(comptime T: type) type {
             }
 
             for (threads) |t| t.join();
+        }
+
+        /// Experimental backend (`-Dio_backend=zio`). `zio.Runtime` manages
+        /// its own N executors internally, so unlike `listenThreaded` this
+        /// does not spawn cpu_count raw OS threads each doing their own
+        /// accept() — a single `workerLoop` call is enough: its
+        /// `group.concurrent()` call (unchanged, shared with the threaded
+        /// backend) is what the runtime actually distributes across
+        /// executors.
+        fn listenZio(self: *Self, options: ListenOptions) !void {
+            const zio = @import("zio");
+
+            const port = options.port orelse self.config.port;
+            const host = options.host orelse self.config.host;
+
+            const gpa = std.heap.smp_allocator;
+
+            var rt = try zio.Runtime.init(gpa, .{ .executors = .auto });
+            defer rt.deinit();
+            const io = rt.io();
+
+            const address = try Io.net.IpAddress.parse(host, port);
+            var listener = try address.listen(io, .{ .reuse_address = true });
+            defer listener.deinit(io);
+
+            std.log.info("Server listening on http://{s}:{d} (io_backend=zio)", .{ host, port });
+
+            for (self.interval_threads.items) |*entry| {
+                entry.io = io;
+                entry.thread = std.Thread.spawn(.{}, intervalLoop, .{entry}) catch continue;
+            }
+
+            const views_idx_ptr: ?*const views_mod.ViewsIndex = if (self.views_index) |*idx| idx else null;
+
+            const worker_ctx = WorkerCtx{
+                .io = io,
+                .gpa = gpa,
+                .listener = &listener,
+                .router = &self.router,
+                .static_config = self.static_config,
+                .views_index = views_idx_ptr,
+                .config = self.config,
+                .error_handler = self.error_handler,
+                ._db = if (self._db) |*d| @as(*const Database, d) else null,
+                .decorations = if (@sizeOf(T) == 0) null else @as(*const anyopaque, @ptrCast(&self.decorations)),
+                .ws_route_hubs = self.ws_route_hubs.items,
+                .sse_hub = if (self.sse_hub) |*h| h else null,
+                .global_middlewares = self.global_middlewares[0..self.global_middleware_count],
+                .path_middlewares = self.path_middlewares[0..self.path_middleware_count],
+                .route_middlewares = self.route_middlewares.items,
+            };
+
+            workerLoop(worker_ctx);
         }
     };
 }

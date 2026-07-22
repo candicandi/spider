@@ -1,5 +1,13 @@
 const std = @import("std");
 
+/// Which `std.Io` implementation `Server.listen()` constructs.
+/// `.threaded` is the default: a bounded `Io.Threaded` pool
+/// (`cpu_count - 1` concurrent async tasks, unlimited `.concurrent()`).
+/// `.zio` is experimental: an event-driven runtime (io_uring/epoll/kqueue)
+/// with no such thread-per-task ceiling for I/O-bound work — see
+/// `zio_backend_test.zig` for a benchmark demonstrating the difference.
+const IoBackend = enum { threaded, zio };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -7,6 +15,15 @@ pub fn build(b: *std.Build) void {
     const with_r2 = b.option(bool, "r2", "Enable Cloudflare R2 support") orelse false;
     const with_sqlite = b.option(bool, "sqlite", "Enable SQLite support") orelse false;
     const with_qrcode = b.option(bool, "qrcode", "Enable QR code generation") orelse false;
+    const io_backend = b.option(
+        IoBackend,
+        "io_backend",
+        "I/O backend for Server.listen(): threaded (default, stable) or zio (experimental, event-driven)",
+    ) orelse .threaded;
+
+    const build_options = b.addOptions();
+    build_options.addOption(IoBackend, "io_backend", io_backend);
+    const build_options_mod = build_options.createModule();
 
     const pacman_dep = b.dependency("pacman", .{});
     const pg_dep = b.dependency("pg", .{ .target = target, .optimize = optimize });
@@ -20,8 +37,17 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "pacman", .module = pacman_dep.module("pacman") },
             .{ .name = "pg", .module = pg_dep.module("pg") },
+            .{ .name = "spider_build_options", .module = build_options_mod },
         },
     });
+
+    if (io_backend == .zio) {
+        const zio_dep = b.lazyDependency("zio", .{
+            .target = target,
+            .optimize = optimize,
+        }) orelse unreachable;
+        mod.addImport("zio", zio_dep.module("zio"));
+    }
 
     if (with_pg) {
         const pg_module_dep = b.lazyDependency("spider_pg", .{
@@ -127,6 +153,29 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
 
+    // test-zio-backend — integration test for the zio io_backend: starts a
+    // real Server.listen() and hits it with real concurrent HTTP requests.
+    // Only exists when `-Dio_backend=zio` is passed, since it can't build
+    // against a `mod` that doesn't have `zio` wired in. Has side effects
+    // (binds a TCP listener), so it's a separate step from `test`.
+    if (io_backend == .zio) {
+        const zio_backend_test = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("zio_backend_test.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "spider", .module = mod },
+                    .{ .name = "pacman", .module = pacman_dep.module("pacman") },
+                },
+            }),
+        });
+        const run_zio_backend_test = b.addRunArtifact(zio_backend_test);
+        run_zio_backend_test.has_side_effects = true;
+        const test_zio_backend_step = b.step("test-zio-backend", "Run zio io_backend integration test (requires -Dio_backend=zio)");
+        test_zio_backend_step.dependOn(&run_zio_backend_test.step);
+    }
+
     // test-pg — pg wrapper integration tests (requires PostgreSQL)
     const pg_lib_mod = pg_dep.module("pg");
 
@@ -158,7 +207,7 @@ pub fn build(b: *std.Build) void {
     // test-sqlite — sqlite wrapper tests (uses :memory:, no external DB needed)
     const zqlite_mod = zqlite_dep.module("zqlite");
 
-        const sqlite_test = b.addTest(.{
+    const sqlite_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("modules/sqlite/src/sqlite.zig"),
             .target = target,
