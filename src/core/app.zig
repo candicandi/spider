@@ -795,9 +795,22 @@ pub fn Server(comptime T: type) type {
         // Lazily creates the server's single shared SSE hub. Idempotent —
         // safe to call from .sse(), .sseInterval(), and mount() (when a
         // mounted Group has SSE routes of its own).
+        //
+        // Uses a real, dedicated Io.Threaded — not .init_single_threaded,
+        // which is a static stub (.allocator = .failing, .concurrent_limit
+        // = .nothing) documented as never coordinating real concurrency.
+        // The Hub's mutex/sleep/timestamp calls ARE exercised concurrently
+        // for real (one call path per live SSE connection, each running
+        // under the main server's Io), so they need an Io whose Mutex is
+        // actually safe to contend on from multiple threads. This instance
+        // never calls .async()/.concurrent() (Hub only uses blocking sync
+        // primitives), so a real Io.Threaded here spawns no extra worker
+        // threads in practice — it's decoupled from whichever io_backend
+        // the main Server.listen() uses, which is fine: SSE's own
+        // synchronization doesn't need to match it.
         fn ensureSseHub(self: *Self) void {
             if (self.sse_hub == null) {
-                self.sse_threaded = std.Io.Threaded.init_single_threaded;
+                self.sse_threaded = std.Io.Threaded.init(std.heap.smp_allocator, .{});
                 self.sse_hub = Hub.init(std.heap.smp_allocator, self.sse_threaded.?.io());
             }
         }
@@ -993,7 +1006,15 @@ pub fn Server(comptime T: type) type {
 
             const gpa = std.heap.smp_allocator;
 
-            var rt = try zio.Runtime.init(gpa, .{ .executors = .auto });
+            // A "Coroutine stack overflow!" abort chased through this code
+            // turned out to be a red herring: root cause was an app-level
+            // template bug (a component including itself, unbounded
+            // recursive parse+render — see git history on
+            // BottomNavGatekeeper.html in orbitx), not anything about zio's
+            // stack sizing or pooling. Left at zio's own defaults.
+            var rt = try zio.Runtime.init(gpa, .{
+                .executors = .auto,
+            });
             defer rt.deinit();
             const io = rt.io();
 

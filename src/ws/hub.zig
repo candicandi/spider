@@ -6,7 +6,7 @@ pub const Hub = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     mutex: std.Io.Mutex,
-    connections: std.ArrayListUnmanaged(Connection) = .empty,
+    connections: std.ArrayListUnmanaged(*ConnectionSlot) = .empty,
     channel_history: std.StringHashMapUnmanaged(ChannelHistory) = .empty,
 
     heartbeat_thread: ?std.Thread = null,
@@ -28,6 +28,36 @@ pub const Hub = struct {
         namespace: []const u8 = "",
         type: enum { ws, sse } = .ws,
         last_activity: ?std.Io.Timestamp = null,
+    };
+
+    /// Heap-allocated (stable address) so a broadcast/heartbeat/sweep
+    /// snapshot can hold a *pointer* to it instead of copying `Connection`
+    /// by value. That matters because io_mutex must be the SAME lock
+    /// instance for every holder — a copy would be a distinct, useless
+    /// lock that excludes nothing. io_mutex is what makes "close this
+    /// connection" (remove()) and "write to this connection" (any single
+    /// broadcast/heartbeat/sweep call) mutually exclusive for THIS
+    /// connection specifically, without requiring the Hub's global
+    /// `mutex` to stay held during socket I/O (which would stall every
+    /// other connection behind one slow/stuck client).
+    ///
+    /// io_mutex alone isn't enough, though: broadcast(), emitTo(),
+    /// sendHeartbeats() and sweepDeadConnections() can all be running
+    /// concurrently, each with its OWN snapshot that may include the SAME
+    /// slot. io_mutex only keeps one writer and remove() from touching the
+    /// fd at the same time — it says nothing about whether some OTHER
+    /// concurrent snapshot still holds a pointer to this slot when remove()
+    /// is done with it. refs answers that: every snapshot that picks up
+    /// this slot bumps it (under the Hub's global mutex, alongside
+    /// remove()'s own decrement, so the count itself never races), and
+    /// whichever side's release drops it to zero is the one that actually
+    /// frees the memory. remove()'s own reference to the slot (the one the
+    /// connections list itself holds) counts as 1 from creation.
+    const ConnectionSlot = struct {
+        conn: Connection,
+        io_mutex: std.Io.Mutex = .init,
+        closed: std.atomic.Value(bool) = .init(false),
+        refs: std.atomic.Value(usize) = .init(1),
     };
 
     pub const HistoryEntry = struct {
@@ -63,8 +93,9 @@ pub const Hub = struct {
         self.stopHeartbeat();
         self.stopSweep();
 
-        for (self.connections.items) |conn| {
-            conn.stream.close(self.io);
+        for (self.connections.items) |slot| {
+            slot.conn.stream.close(self.io);
+            self.releaseSlot(slot);
         }
         self.connections.deinit(self.allocator);
 
@@ -79,34 +110,66 @@ pub const Hub = struct {
     pub fn add(self: *Hub, conn: Connection) !void {
         self.mutex.lock(self.io) catch return error.LockFailed;
         defer self.mutex.unlock(self.io);
-        for (self.connections.items) |c| {
-            if (c.id == conn.id) return error.DuplicateId;
+        for (self.connections.items) |slot| {
+            if (slot.conn.id == conn.id) return error.DuplicateId;
         }
-        var c = conn;
-        c.last_activity = self.now();
-        try self.connections.append(self.allocator, c);
+        const slot = try self.allocator.create(ConnectionSlot);
+        errdefer self.allocator.destroy(slot);
+        slot.* = .{ .conn = conn };
+        slot.conn.last_activity = self.now();
+        try self.connections.append(self.allocator, slot);
     }
 
     pub fn updateChannel(self: *Hub, conn_id: u64, channel: []const u8) !void {
         self.mutex.lock(self.io) catch return error.LockFailed;
         defer self.mutex.unlock(self.io);
-        for (self.connections.items) |*conn| {
-            if (conn.id == conn_id) {
-                conn.channel = channel;
+        for (self.connections.items) |slot| {
+            if (slot.conn.id == conn_id) {
+                slot.conn.channel = channel;
                 return;
             }
         }
     }
 
+    /// Removes the connection from the list (so no future broadcast/
+    /// heartbeat/sweep snapshot can find it), waiting on io_mutex first
+    /// to make sure no in-flight write is currently using it. That wait
+    /// happens *after* releasing the Hub's global `mutex`, so a
+    /// slow-to-finish write on this one connection can't stall
+    /// add()/remove()/broadcast() calls for any other connection.
+    ///
+    /// Does NOT close conn.stream — every caller (buildHandler for both
+    /// SSE and WS, in sse.zig/app.zig) registers the connection from
+    /// inside a Handler that's already running under handleConnection's
+    /// own `defer ctx.stream.close(ctx.io)`, which is what actually owns
+    /// and closes the fd once the handler returns. Closing it here too
+    /// used to double-close: the first close() releases the fd number
+    /// back to the OS, which can immediately hand that same number to a
+    /// brand new connection — and the second close() (or a concurrent
+    /// recv() on that new connection racing it) then hits the wrong
+    /// socket. The io_mutex wait below is what remove() actually needs to
+    /// provide: proof that no write is touching the stream right now,
+    /// before handleConnection's defer is allowed to close it for real.
     pub fn remove(self: *Hub, conn_id: u64) void {
-        self.mutex.lock(self.io) catch return;
-        defer self.mutex.unlock(self.io);
-        for (self.connections.items, 0..) |conn, i| {
-            if (conn.id == conn_id) {
-                _ = self.connections.orderedRemove(i);
-                return;
+        const slot = blk: {
+            self.mutex.lock(self.io) catch return;
+            defer self.mutex.unlock(self.io);
+            for (self.connections.items, 0..) |slot, i| {
+                if (slot.conn.id == conn_id) {
+                    _ = self.connections.orderedRemove(i);
+                    break :blk slot;
+                }
             }
-        }
+            return;
+        };
+
+        slot.io_mutex.lock(self.io) catch {
+            self.releaseSlot(slot);
+            return;
+        };
+        slot.closed.store(true, .release);
+        slot.io_mutex.unlock(self.io);
+        self.releaseSlot(slot);
     }
 
     pub fn count(self: *Hub) usize {
@@ -115,39 +178,61 @@ pub const Hub = struct {
         return self.connections.items.len;
     }
 
+    /// Drops one reference (see ConnectionSlot's doc comment) and frees
+    /// the slot if that was the last one. Every snapshot that picks up a
+    /// slot must eventually call this exactly once for it; remove() calls
+    /// it once too, for the connections list's own original reference.
+    fn releaseSlot(self: *Hub, slot: *ConnectionSlot) void {
+        if (slot.refs.fetchSub(1, .release) == 1) {
+            self.allocator.destroy(slot);
+        }
+    }
+
+    /// Runs `writeFn(self, slot.conn.stream, ...args)` while holding
+    /// slot's own io_mutex — never races remove()'s close() for THIS
+    /// connection, without needing the Hub's global `mutex` held during
+    /// the write. error.AlreadyClosed means remove() got there first
+    /// (the connection is simply gone, not a failed write — callers
+    /// should not treat this as "dead" and try to remove it again).
+    /// Does NOT release the caller's reference on `slot` — the caller
+    /// (whoever built the snapshot) still owns that and must call
+    /// releaseSlot() itself once done with it.
+    fn writeToSlot(self: *Hub, slot: *ConnectionSlot, comptime writeFn: anytype, args: anytype) !void {
+        slot.io_mutex.lock(self.io) catch return error.LockFailed;
+        defer slot.io_mutex.unlock(self.io);
+        if (slot.closed.load(.acquire)) return error.AlreadyClosed;
+        return @call(.auto, writeFn, .{ self, slot.conn.stream } ++ args);
+    }
+
+    /// Adds `slot` to a broadcast/heartbeat/sweep snapshot, taking a
+    /// reference for it (ConnectionSlot.refs). Must be called while still
+    /// holding the Hub's global `mutex` — the same lock add()/remove() use
+    /// around their own refs changes, so the count itself never races.
+    /// Every slot appended this way must get exactly one releaseSlot()
+    /// call back once the caller is done with it.
+    fn snapshotAppend(self: *Hub, snapshot: *std.ArrayListUnmanaged(*ConnectionSlot), slot: *ConnectionSlot) void {
+        snapshot.append(self.allocator, slot) catch return;
+        _ = slot.refs.fetchAdd(1, .monotonic);
+    }
+
     pub fn broadcast(self: *Hub, message: []const u8) void {
         self.mutex.lock(self.io) catch return;
-        var snapshot: std.ArrayListUnmanaged(Connection) = .empty;
+        var snapshot: std.ArrayListUnmanaged(*ConnectionSlot) = .empty;
         defer snapshot.deinit(self.allocator);
-        for (self.connections.items) |conn| {
-            snapshot.append(self.allocator, conn) catch {};
+        for (self.connections.items) |slot| {
+            self.snapshotAppend(&snapshot, slot);
         }
         self.mutex.unlock(self.io);
 
-        var dead: std.ArrayListUnmanaged(u64) = .empty;
-        defer dead.deinit(self.allocator);
-
-        for (snapshot.items) |conn| {
-            switch (conn.type) {
-                .ws => self.sendText(conn.stream, message) catch {
-                    dead.append(self.allocator, conn.id) catch {};
-                },
-                .sse => self.sendSse(conn.stream, "message", message) catch {
-                    dead.append(self.allocator, conn.id) catch {};
-                },
-            }
-        }
-
-        if (dead.items.len == 0) return;
-        self.mutex.lock(self.io) catch return;
-        defer self.mutex.unlock(self.io);
-        for (dead.items) |id| {
-            for (self.connections.items, 0..) |conn, i| {
-                if (conn.id == id) {
-                    _ = self.connections.orderedRemove(i);
-                    break;
-                }
-            }
+        for (snapshot.items) |slot| {
+            const failed = switch (slot.conn.type) {
+                .ws => self.writeToSlot(slot, sendText, .{message}),
+                .sse => self.writeToSlot(slot, sendSse, .{ "message", message }),
+            };
+            failed catch |err| {
+                if (err != error.AlreadyClosed) self.remove(slot.conn.id);
+            };
+            self.releaseSlot(slot);
         }
     }
 
@@ -238,67 +323,39 @@ pub const Hub = struct {
 
     fn broadcastEvent(self: *Hub, event: []const u8, data: []const u8) void {
         self.mutex.lock(self.io) catch return;
-        var snapshot: std.ArrayListUnmanaged(Connection) = .empty;
+        var snapshot: std.ArrayListUnmanaged(*ConnectionSlot) = .empty;
         defer snapshot.deinit(self.allocator);
-        for (self.connections.items) |conn| {
-            if (conn.type == .sse) {
-                snapshot.append(self.allocator, conn) catch {};
+        for (self.connections.items) |slot| {
+            if (slot.conn.type == .sse) {
+                self.snapshotAppend(&snapshot, slot);
             }
         }
         self.mutex.unlock(self.io);
 
-        var dead: std.ArrayListUnmanaged(u64) = .empty;
-        defer dead.deinit(self.allocator);
-
-        for (snapshot.items) |conn| {
-            self.sendSse(conn.stream, event, data) catch {
-                dead.append(self.allocator, conn.id) catch {};
+        for (snapshot.items) |slot| {
+            self.writeToSlot(slot, sendSse, .{ event, data }) catch |err| {
+                if (err != error.AlreadyClosed) self.remove(slot.conn.id);
             };
-        }
-
-        if (dead.items.len == 0) return;
-        self.mutex.lock(self.io) catch return;
-        defer self.mutex.unlock(self.io);
-        for (dead.items) |id| {
-            for (self.connections.items, 0..) |conn, i| {
-                if (conn.id == id) {
-                    _ = self.connections.orderedRemove(i);
-                    break;
-                }
-            }
+            self.releaseSlot(slot);
         }
     }
 
     fn broadcastToChannelEvent(self: *Hub, channel: []const u8, id: u64, event: []const u8, data: []const u8) void {
         self.mutex.lock(self.io) catch return;
-        var snapshot: std.ArrayListUnmanaged(Connection) = .empty;
+        var snapshot: std.ArrayListUnmanaged(*ConnectionSlot) = .empty;
         defer snapshot.deinit(self.allocator);
-        for (self.connections.items) |conn| {
-            if (conn.type == .sse and std.mem.eql(u8, conn.channel, channel)) {
-                snapshot.append(self.allocator, conn) catch {};
+        for (self.connections.items) |slot| {
+            if (slot.conn.type == .sse and std.mem.eql(u8, slot.conn.channel, channel)) {
+                self.snapshotAppend(&snapshot, slot);
             }
         }
         self.mutex.unlock(self.io);
 
-        var dead: std.ArrayListUnmanaged(u64) = .empty;
-        defer dead.deinit(self.allocator);
-
-        for (snapshot.items) |conn| {
-            self.sendSseWithId(conn.stream, id, event, data) catch {
-                dead.append(self.allocator, conn.id) catch {};
+        for (snapshot.items) |slot| {
+            self.writeToSlot(slot, sendSseWithId, .{ id, event, data }) catch |err| {
+                if (err != error.AlreadyClosed) self.remove(slot.conn.id);
             };
-        }
-
-        if (dead.items.len == 0) return;
-        self.mutex.lock(self.io) catch return;
-        defer self.mutex.unlock(self.io);
-        for (dead.items) |dead_id| {
-            for (self.connections.items, 0..) |conn, i| {
-                if (conn.id == dead_id) {
-                    _ = self.connections.orderedRemove(i);
-                    break;
-                }
-            }
+            self.releaseSlot(slot);
         }
     }
 
@@ -316,39 +373,24 @@ pub const Hub = struct {
 
     pub fn broadcastToChannel(self: *Hub, channel: []const u8, message: []const u8) void {
         self.mutex.lock(self.io) catch return;
-        var snapshot: std.ArrayListUnmanaged(Connection) = .empty;
+        var snapshot: std.ArrayListUnmanaged(*ConnectionSlot) = .empty;
         defer snapshot.deinit(self.allocator);
-        for (self.connections.items) |conn| {
-            if (std.mem.eql(u8, conn.channel, channel)) {
-                snapshot.append(self.allocator, conn) catch {};
+        for (self.connections.items) |slot| {
+            if (std.mem.eql(u8, slot.conn.channel, channel)) {
+                self.snapshotAppend(&snapshot, slot);
             }
         }
         self.mutex.unlock(self.io);
 
-        var dead: std.ArrayListUnmanaged(u64) = .empty;
-        defer dead.deinit(self.allocator);
-
-        for (snapshot.items) |conn| {
-            switch (conn.type) {
-                .ws => self.sendText(conn.stream, message) catch {
-                    dead.append(self.allocator, conn.id) catch {};
-                },
-                .sse => self.sendSse(conn.stream, "message", message) catch {
-                    dead.append(self.allocator, conn.id) catch {};
-                },
-            }
-        }
-
-        if (dead.items.len == 0) return;
-        self.mutex.lock(self.io) catch return;
-        defer self.mutex.unlock(self.io);
-        for (dead.items) |id| {
-            for (self.connections.items, 0..) |conn, i| {
-                if (conn.id == id) {
-                    _ = self.connections.orderedRemove(i);
-                    break;
-                }
-            }
+        for (snapshot.items) |slot| {
+            const failed = switch (slot.conn.type) {
+                .ws => self.writeToSlot(slot, sendText, .{message}),
+                .sse => self.writeToSlot(slot, sendSse, .{ "message", message }),
+            };
+            failed catch |err| {
+                if (err != error.AlreadyClosed) self.remove(slot.conn.id);
+            };
+            self.releaseSlot(slot);
         }
     }
 
@@ -418,18 +460,12 @@ pub const Hub = struct {
         try writer.flush();
     }
 
+    // Goes through remove() (global-lock find-and-unlink, then per-slot
+    // io_mutex before the actual close) for each id, same as any other
+    // caller — heartbeat/sweep discovering a dead connection isn't a
+    // different case from a client disconnecting normally.
     fn pruneDead(self: *Hub, dead_ids: []const u64) void {
-        if (dead_ids.len == 0) return;
-        self.mutex.lock(self.io) catch return;
-        defer self.mutex.unlock(self.io);
-        for (dead_ids) |id| {
-            for (self.connections.items, 0..) |conn, i| {
-                if (conn.id == id) {
-                    _ = self.connections.orderedRemove(i);
-                    break;
-                }
-            }
-        }
+        for (dead_ids) |id| self.remove(id);
     }
 
     fn touchActivity(self: *Hub, touched_ids: []const u64, ts: std.Io.Timestamp) void {
@@ -437,9 +473,9 @@ pub const Hub = struct {
         self.mutex.lock(self.io) catch return;
         defer self.mutex.unlock(self.io);
         for (touched_ids) |id| {
-            for (self.connections.items) |*conn| {
-                if (conn.id == id) {
-                    conn.last_activity = ts;
+            for (self.connections.items) |slot| {
+                if (slot.conn.id == id) {
+                    slot.conn.last_activity = ts;
                     break;
                 }
             }
@@ -486,10 +522,10 @@ pub const Hub = struct {
     /// calls on each tick, and what tests exercise instead of racing a timer.
     pub fn sendHeartbeats(self: *Hub) void {
         self.mutex.lock(self.io) catch return;
-        var snapshot: std.ArrayListUnmanaged(Connection) = .empty;
+        var snapshot: std.ArrayListUnmanaged(*ConnectionSlot) = .empty;
         defer snapshot.deinit(self.allocator);
-        for (self.connections.items) |conn| {
-            if (conn.type == .sse) snapshot.append(self.allocator, conn) catch {};
+        for (self.connections.items) |slot| {
+            if (slot.conn.type == .sse) self.snapshotAppend(&snapshot, slot);
         }
         self.mutex.unlock(self.io);
 
@@ -499,12 +535,14 @@ pub const Hub = struct {
         var touched: std.ArrayListUnmanaged(u64) = .empty;
         defer touched.deinit(self.allocator);
 
-        for (snapshot.items) |conn| {
-            if (self.sendSseComment(conn.stream, "heartbeat")) |_| {
-                touched.append(self.allocator, conn.id) catch {};
-            } else |_| {
-                dead.append(self.allocator, conn.id) catch {};
-            }
+        for (snapshot.items) |slot| {
+            defer self.releaseSlot(slot);
+            self.writeToSlot(slot, sendSseComment, .{"heartbeat"}) catch |err| {
+                if (err == error.AlreadyClosed) continue;
+                dead.append(self.allocator, slot.conn.id) catch {};
+                continue;
+            };
+            touched.append(self.allocator, slot.conn.id) catch {};
         }
 
         self.pruneDead(dead.items);
@@ -547,14 +585,14 @@ pub const Hub = struct {
     pub fn sweepDeadConnections(self: *Hub, idle_threshold_ms: u64) void {
         const ts = self.now();
         self.mutex.lock(self.io) catch return;
-        var snapshot: std.ArrayListUnmanaged(Connection) = .empty;
+        var snapshot: std.ArrayListUnmanaged(*ConnectionSlot) = .empty;
         defer snapshot.deinit(self.allocator);
-        for (self.connections.items) |conn| {
+        for (self.connections.items) |slot| {
             // No last_activity yet (never touched since add()) counts as
             // idle — always eligible for the first sweep pass.
-            const idle_ms = if (conn.last_activity) |la| la.durationTo(ts).toMilliseconds() else std.math.maxInt(i64);
-            if (conn.type == .sse and idle_ms >= @as(i64, @intCast(idle_threshold_ms))) {
-                snapshot.append(self.allocator, conn) catch {};
+            const idle_ms = if (slot.conn.last_activity) |la| la.durationTo(ts).toMilliseconds() else std.math.maxInt(i64);
+            if (slot.conn.type == .sse and idle_ms >= @as(i64, @intCast(idle_threshold_ms))) {
+                self.snapshotAppend(&snapshot, slot);
             }
         }
         self.mutex.unlock(self.io);
@@ -564,12 +602,14 @@ pub const Hub = struct {
         var touched: std.ArrayListUnmanaged(u64) = .empty;
         defer touched.deinit(self.allocator);
 
-        for (snapshot.items) |conn| {
-            if (self.sendSseComment(conn.stream, "ping")) |_| {
-                touched.append(self.allocator, conn.id) catch {};
-            } else |_| {
-                dead.append(self.allocator, conn.id) catch {};
-            }
+        for (snapshot.items) |slot| {
+            defer self.releaseSlot(slot);
+            self.writeToSlot(slot, sendSseComment, .{"ping"}) catch |err| {
+                if (err == error.AlreadyClosed) continue;
+                dead.append(self.allocator, slot.conn.id) catch {};
+                continue;
+            };
+            touched.append(self.allocator, slot.conn.id) catch {};
         }
 
         self.pruneDead(dead.items);
@@ -663,6 +703,9 @@ test "Hub: broadcast removes dead connection" {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     const sockets = try makeSocketPair();
+    // remove() no longer closes the socket itself (that's handleConnection's
+    // job in real usage — see remove()'s doc comment) — the test owns
+    // closing sockets[0] here since nothing else will.
     defer sockets[0].close(io);
     defer sockets[1].close(io);
     var hub = Hub.init(testing.allocator, io);
@@ -878,6 +921,8 @@ test "Hub: broadcastToChannel removes dead connection" {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     const sockets = try makeSocketPair();
+    // remove() doesn't close the socket itself (see its doc comment) —
+    // the test owns closing sockets[0] here since nothing else will.
     defer sockets[0].close(io);
     defer sockets[1].close(io);
     var hub = Hub.init(testing.allocator, io);
@@ -895,6 +940,8 @@ test "Hub: emitTo removes dead connection on write failure" {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     const sockets = try makeSocketPair();
+    // remove() doesn't close the socket itself (see its doc comment) —
+    // the test owns closing sockets[0] here since nothing else will.
     defer sockets[0].close(io);
     defer sockets[1].close(io);
     var hub = Hub.init(testing.allocator, io);
@@ -912,6 +959,8 @@ test "Hub: emit (global) removes dead connection on write failure" {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     const sockets = try makeSocketPair();
+    // remove() doesn't close the socket itself (see its doc comment) —
+    // the test owns closing sockets[0] here since nothing else will.
     defer sockets[0].close(io);
     defer sockets[1].close(io);
     var hub = Hub.init(testing.allocator, io);
@@ -991,6 +1040,10 @@ test "Hub: sendHeartbeats removes a dead sse connection" {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     const sockets = try makeSocketPair();
+    // remove() doesn't close the socket itself (see its doc comment) —
+    // the test owns closing sockets[0] here since nothing else will (it's
+    // no longer registered by the time hub.deinit() runs).
+    defer sockets[0].close(io);
     defer sockets[1].close(io);
     var hub = Hub.init(testing.allocator, io);
     defer hub.deinit();
@@ -1047,6 +1100,10 @@ test "Hub: sweepDeadConnections removes a dead sse connection" {
     var threaded = std.Io.Threaded.init_single_threaded;
     const io = threaded.io();
     const sockets = try makeSocketPair();
+    // remove() doesn't close the socket itself (see its doc comment) —
+    // the test owns closing sockets[0] here since nothing else will (it's
+    // no longer registered by the time hub.deinit() runs).
+    defer sockets[0].close(io);
     defer sockets[1].close(io);
     var hub = Hub.init(testing.allocator, io);
     defer hub.deinit();
