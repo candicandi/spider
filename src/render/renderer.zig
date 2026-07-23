@@ -190,14 +190,10 @@ fn resolveValue(ctx: *const Context, expr: []const u8) ?Value {
     var it = std.mem.splitScalar(u8, expr, '.');
     const first_seg = it.next() orelse return null;
 
-    var current: ?Value = if (std.mem.indexOfScalar(u8, first_seg, '[')) |bracket_pos|
-        blk: {
-            const list_name = first_seg[0..bracket_pos];
-            break :blk resolveSegment(ctx.get(list_name), first_seg[bracket_pos..])
-                orelse return null;
-        }
-    else
-        ctx.get(first_seg) orelse return null;
+    var current: ?Value = if (std.mem.indexOfScalar(u8, first_seg, '[')) |bracket_pos| blk: {
+        const list_name = first_seg[0..bracket_pos];
+        break :blk resolveSegment(ctx.get(list_name), first_seg[bracket_pos..]) orelse return null;
+    } else ctx.get(first_seg) orelse return null;
 
     while (it.next()) |seg| {
         current = resolveSegment(current, seg) orelse return null;
@@ -255,6 +251,21 @@ fn evalBool(ctx: *Context, expr: []const u8, alc: std.mem.Allocator) bool {
         const left = trimWhitespace(expr[0..idx]);
         const right = trimWhitespace(expr[idx + 2 ..]);
         return evalNumCompare(ctx, left, right, .gt, alc);
+    }
+
+    // Unary "!" negation — checked after and/or/comparison so a genuine
+    // binary condition (e.g. "role != \"council\"") is never misread as a
+    // leading "!"; a real leading "!" only survives to here for something
+    // like "!is_admin_tier". Recurses so "!a and b" still parses as
+    // "(!a) and b" — the " and "/" or " splits above run first and hand
+    // each side back into evalBool, where this check applies to "!a" on
+    // its own. Note: this does NOT add general parenthesized grouping —
+    // evalBool has no paren-stripping, so "!(a and b)" would still
+    // misparse (the " and " split doesn't know to treat "(a"/"b)" as one
+    // group). Only a plain "!identifier" or "!left op right" is supported.
+    const trimmed = trimWhitespace(expr);
+    if (trimmed.len > 0 and trimmed[0] == '!') {
+        return !evalBool(ctx, trimmed[1..], alc);
     }
 
     if (resolveValue(ctx, expr)) |value| {

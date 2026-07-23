@@ -1064,6 +1064,75 @@ test "and/or no false positives with embedded substrings" {
     }
 }
 
+test "unary not operator - true/false" {
+    const alc = std.testing.allocator;
+    var tmpl = try Template.init(alc, "if (!show) { yes }");
+    defer tmpl.deinit();
+    const r1 = try tmpl.render(.{ .show = false }, alc);
+    defer alc.free(r1);
+    try std.testing.expectEqualStrings("yes", r1);
+    const r2 = try tmpl.render(.{ .show = true }, alc);
+    defer alc.free(r2);
+    try std.testing.expectEqualStrings("", r2);
+}
+
+test "unary not operator - double negation" {
+    const alc = std.testing.allocator;
+    var tmpl = try Template.init(alc, "if (!!show) { yes }");
+    defer tmpl.deinit();
+    const r1 = try tmpl.render(.{ .show = true }, alc);
+    defer alc.free(r1);
+    try std.testing.expectEqualStrings("yes", r1);
+    const r2 = try tmpl.render(.{ .show = false }, alc);
+    defer alc.free(r2);
+    try std.testing.expectEqualStrings("", r2);
+}
+
+test "unary not operator - precedence with and" {
+    const alc = std.testing.allocator;
+    // !a and b: a=false negates to true, b=true → renders
+    var tmpl = try Template.init(alc, "if (!a and b) { yes }");
+    defer tmpl.deinit();
+    const r1 = try tmpl.render(.{ .a = false, .b = true }, alc);
+    defer alc.free(r1);
+    try std.testing.expectEqualStrings("yes", r1);
+    // a=true negates to false → does not render regardless of b
+    const r2 = try tmpl.render(.{ .a = true, .b = true }, alc);
+    defer alc.free(r2);
+    try std.testing.expectEqualStrings("", r2);
+}
+
+test "unary not operator - precedence with or" {
+    const alc = std.testing.allocator;
+    // !a or b: a=true negates to false, b=false → does not render
+    var tmpl = try Template.init(alc, "if (!a or b) { yes }");
+    defer tmpl.deinit();
+    const r1 = try tmpl.render(.{ .a = true, .b = false }, alc);
+    defer alc.free(r1);
+    try std.testing.expectEqualStrings("", r1);
+    // a=false negates to true → renders regardless of b
+    const r2 = try tmpl.render(.{ .a = false, .b = false }, alc);
+    defer alc.free(r2);
+    try std.testing.expectEqualStrings("yes", r2);
+}
+
+test "unary not operator - does not break != operator" {
+    const alc = std.testing.allocator;
+    // "!=" contains "!" but never as the leading character of a trimmed
+    // condition (there's always a left operand before it), so it must
+    // keep working exactly as before this feature was added.
+    var tmpl = try Template.init(alc,
+        \\if (role != "council") { yes }
+    );
+    defer tmpl.deinit();
+    const r1 = try tmpl.render(.{ .role = "admin" }, alc);
+    defer alc.free(r1);
+    try std.testing.expectEqualStrings("yes", r1);
+    const r2 = try tmpl.render(.{ .role = "council" }, alc);
+    defer alc.free(r2);
+    try std.testing.expectEqualStrings("", r2);
+}
+
 test "list index access [0] in interpolation" {
     const alc = std.testing.allocator;
     const Item = struct { name: []const u8, value: i64 };
