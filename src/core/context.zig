@@ -269,6 +269,156 @@ pub const Ctx = struct {
             .cookies = opts.cookies,
         };
     }
+    pub fn viewFragment(self: *Ctx, template_name: []const u8, component_name: []const u8, data: anytype, opts: ResponseOptions) !Response {
+        const vc = self._views orelse return error.ViewsNotConfigured;
+        const io = vc.io;
+
+        if (has_embed) {
+            const Templates = root.spider_templates;
+
+            const view_content = blk: {
+                var buf: [256]u8 = undefined;
+                var j: usize = 0;
+                for (template_name) |c| {
+                    buf[j] = if (c == '/' or c == '-') '_' else c;
+                    j += 1;
+                }
+                const normalized = buf[0..j];
+                @setEvalBranchQuota(10000);
+                inline for (@typeInfo(Templates).@"struct".field_names) |fname| {
+                    if (std.mem.eql(u8, fname, normalized)) {
+                        const instance: Templates = .{};
+                        break :blk @field(instance, fname);
+                    }
+                }
+                self._last_template = template_name;
+                return error.TemplateNotFound;
+            };
+
+            if (std.mem.startsWith(u8, view_content, "-- doc")) {
+                const md_body = view_content["-- doc".len..];
+                const md_html = try zmd.parse(self.arena, md_body, zmd.Formatters{});
+                return Response{
+                    .status = opts.status,
+                    .body = md_html,
+                    .content_type = "text/html; charset=utf-8",
+                    .headers = opts.headers,
+                    .cookies = opts.cookies,
+                };
+            }
+
+            self._last_template = template_name;
+
+            var components = std.StringHashMapUnmanaged([]const u8){};
+            defer {
+                var iter = components.iterator();
+                while (iter.next()) |entry| {
+                    self.arena.free(entry.key_ptr.*);
+                    self.arena.free(entry.value_ptr.*);
+                }
+                components.deinit(self.arena);
+            }
+
+            const embed_inst: Templates = .{};
+            @setEvalBranchQuota(10000);
+            inline for (@typeInfo(Templates).@"struct".field_names) |fname| {
+                const content: []const u8 = @field(embed_inst, fname);
+                try components.put(self.arena, try self.arena.dupe(u8, fname), try self.arena.dupe(u8, content));
+                if (comptime std.mem.startsWith(u8, fname, "components_")) {
+                    const alias = fname["components_".len..];
+                    try components.put(self.arena, try self.arena.dupe(u8, alias), try self.arena.dupe(u8, content));
+                }
+            }
+
+            var tmpl_instance = try Template.init(self.arena, view_content);
+            defer tmpl_instance.deinit();
+            tmpl_instance.components = components;
+
+            const rendered_html = try tmpl_instance.renderFragment(component_name, data, self.arena);
+
+            return Response{
+                .status = opts.status,
+                .body = rendered_html,
+                .content_type = "text/html; charset=utf-8",
+                .headers = opts.headers,
+                .cookies = opts.cookies,
+            };
+        }
+
+        const view_path = if (vc.index) |idx|
+            idx.get(template_name) orelse {
+                self._last_template = template_name;
+                return error.TemplateNotFound;
+            }
+        else
+            try std.fmt.allocPrint(self.arena, "{s}/{s}.html", .{ vc.views_dir, template_name });
+
+        const view_content = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            view_path,
+            self.arena,
+            .limited(512 * 1024),
+        ) catch |err| {
+            if (err == error.FileNotFound) {
+                self._last_template = template_name;
+                return error.TemplateNotFound;
+            }
+            return err;
+        };
+
+        if (std.mem.startsWith(u8, view_content, "-- doc")) {
+            const md_body = view_content["-- doc".len..];
+            const md_html = try zmd.parse(self.arena, md_body, zmd.Formatters{});
+            return Response{
+                .status = opts.status,
+                .body = md_html,
+                .content_type = "text/html; charset=utf-8",
+                .headers = opts.headers,
+                .cookies = opts.cookies,
+            };
+        }
+
+        var components = std.StringHashMapUnmanaged([]const u8){};
+        defer {
+            var iter = components.iterator();
+            while (iter.next()) |entry| {
+                self.arena.free(entry.key_ptr.*);
+                self.arena.free(entry.value_ptr.*);
+            }
+            components.deinit(self.arena);
+        }
+
+        if (vc.index) |idx| {
+            for (idx.entries) |entry| {
+                const content = std.Io.Dir.cwd().readFileAlloc(
+                    io,
+                    entry.path,
+                    self.arena,
+                    .limited(512 * 1024),
+                ) catch continue;
+                try components.put(self.arena, try self.arena.dupe(u8, entry.name), content);
+                if (std.mem.startsWith(u8, entry.name, "components_")) {
+                    const alias = entry.name["components_".len..];
+                    try components.put(self.arena, try self.arena.dupe(u8, alias), try self.arena.dupe(u8, content));
+                }
+            }
+        }
+
+        var tmpl_instance = try Template.init(self.arena, view_content);
+        defer tmpl_instance.deinit();
+        tmpl_instance.components = components;
+
+        const rendered = try tmpl_instance.renderFragment(component_name, data, self.arena);
+
+        return Response{
+            .status = opts.status,
+            .body = rendered,
+            .content_type = "text/html; charset=utf-8",
+            .headers = opts.headers,
+            .cookies = opts.cookies,
+        };
+    }
+
     pub fn getBody(self: *Ctx) ?[]const u8 {
         return self.body;
     }

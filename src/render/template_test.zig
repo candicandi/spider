@@ -1229,3 +1229,209 @@ test "call syntax does not regress plain variable interpolation" {
     defer alc.free(r);
     try std.testing.expectEqualStrings("Seven", r);
 }
+
+test "inline component - self-closing invocation" {
+    // Define an inline component at root level, then invoke it via self-closing tag.
+    const alc = std.testing.allocator;
+    const template_str =
+        \\<Header>
+        \\<h1>{ title }</h1>
+        \\</Header>
+        \\<div class="page">
+        \\<Header title="{ page_title }" />
+        \\</div>
+    ;
+    var tmpl = try Template.init(alc, template_str);
+    defer tmpl.deinit();
+    const result = try tmpl.render(.{ .page_title = "My Page" }, alc);
+    defer alc.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<h1>My Page</h1>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<div class=\"page\">") != null);
+    // The definition block itself should NOT render at the definition site.
+    try std.testing.expect(std.mem.indexOf(u8, result, "Header") == null);
+}
+
+test "inline component - with slot" {
+    // Define an inline component with a { slot }, invoke it with content.
+    const alc = std.testing.allocator;
+    const template_str =
+        \\<Card>
+        \\<div class="card"><h2>{ title }</h2><div class="body">{ slot }</div></div>
+        \\</Card>
+        \\<div>
+        \\<Card title="Notice">
+        \\<p>Hello</p>
+        \\</Card>
+        \\</div>
+    ;
+    var tmpl = try Template.init(alc, template_str);
+    defer tmpl.deinit();
+    const result = try tmpl.render(.{ .title = "ignored" }, alc);
+    defer alc.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<h2>Notice</h2>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<p>Hello</p>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<div class=\"card\">") != null);
+}
+
+test "inline component - resolves parent context" {
+    // The inline component's body resolves variables from the caller's context.
+    const alc = std.testing.allocator;
+    const template_str =
+        \\<List>
+        \\<ul>
+        \\for (items) |item| {
+        \\<li>{ item.name }</li>
+        \\}
+        \\</ul>
+        \\</List>
+        \\<List />
+    ;
+    const Item = struct { name: []const u8 };
+    const items = &[_]Item{ .{ .name = "Alice" }, .{ .name = "Bob" } };
+    var tmpl = try Template.init(alc, template_str);
+    defer tmpl.deinit();
+    const result = try tmpl.render(.{ .items = items }, alc);
+    defer alc.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<li>Alice</li>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<li>Bob</li>") != null);
+}
+
+test "multiple inline components in same file" {
+    // Two inline components defined and invoked in one template.
+    const alc = std.testing.allocator;
+    const template_str =
+        \\<Header>
+        \\<h1>{ title }</h1>
+        \\</Header>
+        \\<Footer>
+        \\<p>{ copyright }</p>
+        \\</Footer>
+        \\<Header title="{ page_title }" />
+        \\<Footer />
+    ;
+    var tmpl = try Template.init(alc, template_str);
+    defer tmpl.deinit();
+    const result = try tmpl.render(.{ .page_title = "Welcome", .copyright = "2024" }, alc);
+    defer alc.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<h1>Welcome</h1>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<p>2024</p>") != null);
+}
+
+test "inline component does not shadow existing file component" {
+    // File component "Title" exists. <Title>...</Title> at root level is an
+    // invocation (not a definition) since the name is already registered.
+    const alc = std.testing.allocator;
+    const file_component = "<h1>FILE: { text }</h1><div>{ slot }</div>";
+    var components = std.StringHashMapUnmanaged([]const u8){};
+    try components.put(alc, try alc.dupe(u8, "Title"), try alc.dupe(u8, file_component));
+    defer {
+        var iter = components.iterator();
+        while (iter.next()) |entry| {
+            alc.free(entry.key_ptr.*);
+            alc.free(entry.value_ptr.*);
+        }
+        components.deinit(alc);
+    }
+    const template_str =
+        \\<div><Title>
+        \\<p>slot content</p>
+        \\</Title></div>
+        \\<Title text="{ msg }" />
+    ;
+    var tmpl = try Template.init(alc, template_str);
+    defer tmpl.deinit();
+    tmpl.components = components;
+    const result = try tmpl.render(.{ .msg = "hello" }, alc);
+    defer alc.free(result);
+    // File component renders (inline does not shadow).
+    try std.testing.expect(std.mem.indexOf(u8, result, "FILE: hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "slot content") != null);
+}
+
+test "renderFragment renders inline component with for loop and context" {
+    // renderFragment("DataList", data) should render the inline component's
+    // template with the provided context, without layout or other nodes.
+    const alc = std.testing.allocator;
+    const template_str =
+        \\<DataList>
+        \\<ul>
+        \\for (items) |item| {
+        \\<li>{ item.name }</li>
+        \\}
+        \\</ul>
+        \\</DataList>
+        \\<p>other content</p>
+    ;
+    const Item = struct { name: []const u8 };
+    const items = &[_]Item{ .{ .name = "Alice" }, .{ .name = "Bob" } };
+    var tmpl = try Template.init(alc, template_str);
+    defer tmpl.deinit();
+
+    const fragment = try tmpl.renderFragment("DataList", .{ .items = items }, alc);
+    defer alc.free(fragment);
+
+    // Fragment must contain the list items from the inline component
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "<li>Alice</li>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "<li>Bob</li>") != null);
+    // Fragment must NOT contain "other content" (outside the component)
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "other content") == null);
+}
+
+test "renderFragment resolves context variables" {
+    // renderFragment should resolve variables passed via context.
+    const alc = std.testing.allocator;
+    const template_str =
+        \\<Greeting>
+        \\<h1>{ message }, { name }!</h1>
+        \\</Greeting>
+        \\<p>unrelated</p>
+    ;
+    var tmpl = try Template.init(alc, template_str);
+    defer tmpl.deinit();
+    const result = try tmpl.renderFragment("Greeting", .{ .message = "Hello", .name = "World" }, alc);
+    defer alc.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "<h1>Hello, World!</h1>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "unrelated") == null);
+}
+
+test "renderFragment returns error on unknown component" {
+    const alc = std.testing.allocator;
+    const template_str = "<p>nothing here</p>";
+    var tmpl = try Template.init(alc, template_str);
+    defer tmpl.deinit();
+    try std.testing.expectError(error.ComponentNotFound, tmpl.renderFragment("NonExistent", .{}, alc));
+}
+
+test "renderFragment does not include layout" {
+    // renderFragment should NOT extend layout, even if the template has extends.
+    const alc = std.testing.allocator;
+    const layout_html = "<html><body>{ slot }</body></html>";
+    const template_str =
+        \\extends "layout"
+        \\<MyComp>
+        \\<p>fragment content</p>
+        \\</MyComp>
+        \\<p>page content</p>
+    ;
+    var components = std.StringHashMapUnmanaged([]const u8){};
+    try components.put(alc, try alc.dupe(u8, "layout"), try alc.dupe(u8, layout_html));
+    defer {
+        var iter = components.iterator();
+        while (iter.next()) |entry| {
+            alc.free(entry.key_ptr.*);
+            alc.free(entry.value_ptr.*);
+        }
+        components.deinit(alc);
+    }
+    var tmpl = try Template.init(alc, template_str);
+    defer tmpl.deinit();
+    tmpl.components = components;
+    const fragment = try tmpl.renderFragment("MyComp", .{}, alc);
+    defer alc.free(fragment);
+    // Must contain the fragment content
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "fragment content") != null);
+    // Must NOT contain layout elements
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "<html>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "<body>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fragment, "page content") == null);
+}

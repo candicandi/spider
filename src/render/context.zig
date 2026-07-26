@@ -24,7 +24,15 @@ pub const Context = struct {
     }
 
     pub fn set(self: *Context, alc: std.mem.Allocator, key: []const u8, value: Value) !void {
-        try self.values.put(alc, try alc.dupe(u8, key), value);
+        const gop = try self.values.getOrPut(alc, key);
+        if (gop.found_existing) {
+            // Overwriting an existing key: free the old value, otherwise
+            // it's orphaned (leaked) once its map slot is replaced below.
+            freeValue(alc, gop.value_ptr.*);
+        } else {
+            gop.key_ptr.* = try alc.dupe(u8, key);
+        }
+        gop.value_ptr.* = value;
     }
 
     pub fn get(self: *const Context, key: []const u8) ?Value {

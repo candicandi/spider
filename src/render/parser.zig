@@ -90,9 +90,19 @@ pub const Parser = struct {
         return Parser{ .alc = alc, .template = template, .pos = 0 };
     }
 
-    pub fn parse(p: *Parser) !struct { nodes: []Node, layout: ?[]const u8 } {
+    pub fn parse(p: *Parser) !struct { nodes: []Node, layout: ?[]const u8, inline_components: std.StringHashMapUnmanaged([]const u8) } {
         var nodes: std.ArrayList(Node) = .empty;
         errdefer nodes.deinit(p.alc);
+
+        var inline_components = std.StringHashMapUnmanaged([]const u8){};
+        errdefer {
+            var iter = inline_components.iterator();
+            while (iter.next()) |entry| {
+                p.alc.free(entry.key_ptr.*);
+                p.alc.free(entry.value_ptr.*);
+            }
+            inline_components.deinit(p.alc);
+        }
 
         var layout_name: ?[]const u8 = null;
 
@@ -132,7 +142,7 @@ pub const Parser = struct {
             }
         }
 
-        return .{ .nodes = try nodes.toOwnedSlice(p.alc), .layout = layout_name };
+        return .{ .nodes = try nodes.toOwnedSlice(p.alc), .layout = layout_name, .inline_components = inline_components };
     }
 
     fn parseComponent(p: *Parser) !Node {
