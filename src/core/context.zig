@@ -160,14 +160,6 @@ pub const Ctx = struct {
             self._last_template = name;
 
             var components = std.StringHashMapUnmanaged([]const u8){};
-            defer {
-                var iter = components.iterator();
-                while (iter.next()) |entry| {
-                    self.arena.free(entry.key_ptr.*);
-                    self.arena.free(entry.value_ptr.*);
-                }
-                components.deinit(self.arena);
-            }
 
             const embed_inst: Templates = .{};
             @setEvalBranchQuota(10000);
@@ -230,14 +222,6 @@ pub const Ctx = struct {
         }
 
         var components = std.StringHashMapUnmanaged([]const u8){};
-        defer {
-            var iter = components.iterator();
-            while (iter.next()) |entry| {
-                self.arena.free(entry.key_ptr.*);
-                self.arena.free(entry.value_ptr.*);
-            }
-            components.deinit(self.arena);
-        }
 
         if (vc.index) |idx| {
             for (idx.entries) |entry| {
@@ -310,14 +294,6 @@ pub const Ctx = struct {
             self._last_template = template_name;
 
             var components = std.StringHashMapUnmanaged([]const u8){};
-            defer {
-                var iter = components.iterator();
-                while (iter.next()) |entry| {
-                    self.arena.free(entry.key_ptr.*);
-                    self.arena.free(entry.value_ptr.*);
-                }
-                components.deinit(self.arena);
-            }
 
             const embed_inst: Templates = .{};
             @setEvalBranchQuota(10000);
@@ -379,14 +355,6 @@ pub const Ctx = struct {
         }
 
         var components = std.StringHashMapUnmanaged([]const u8){};
-        defer {
-            var iter = components.iterator();
-            while (iter.next()) |entry| {
-                self.arena.free(entry.key_ptr.*);
-                self.arena.free(entry.value_ptr.*);
-            }
-            components.deinit(self.arena);
-        }
 
         if (vc.index) |idx| {
             for (idx.entries) |entry| {
