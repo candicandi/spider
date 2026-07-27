@@ -7,6 +7,7 @@ src/test_templates.zig
 **/old_*.zig
 **/_old*.zig
 tasks.md
+ARENA_FREE_CRASH_FIX.md
 seven/
 build.zig_main_for_test.zig
 .env

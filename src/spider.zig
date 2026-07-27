@@ -96,4 +96,5 @@ test {
     _ = @import("modules/push.zig");
     _ = @import("render/zmd/zmd.zig");
     _ = @import("render/template_test.zig");
+    _ = @import("core/context_test.zig");
 }

@@ -429,6 +429,59 @@ pub const Ctx = struct {
         return self.header("HX-Boosted") != null;
     }
 
+    /// Raw getter for the `HX-Request-Type` header, introduced in htmx 4.0.
+    /// Confirmed values per the official htmx docs: `"partial"` (a fragment
+    /// swap) or `"full"` (a full-page request, including boosted navigation
+    /// and history restores). Returns `null` on htmx 2.x requests — that
+    /// version never sends this header — and on non-htmx requests.
+    ///
+    /// This is a thin, unopinionated wrapper around `header()`, mirroring
+    /// `isHtmx()`/`isBoosted()`. Most call sites should prefer `requestKind()`
+    /// below, which already resolves the 2.x/4.0 difference for you.
+    pub fn requestType(self: *Ctx) ?[]const u8 {
+        return self.header("HX-Request-Type");
+    }
+
+    /// Consolidated classification of an htmx request, spanning both the
+    /// 2.x header set (`HX-Request`, `HX-Boosted`) and the 4.0 header
+    /// (`HX-Request-Type: partial|full`).
+    pub const RequestKind = enum {
+        /// A fragment/partial swap.
+        /// - htmx 4.0: `HX-Request-Type: partial`.
+        /// - htmx 2.x: `HX-Request` present and `HX-Boosted` absent.
+        fragment,
+        /// A boosted navigation (`hx-boost`) — an AJAX request that
+        /// represents real navigation, not a UI fragment swap.
+        /// - htmx 4.0 and 2.x: `HX-Boosted` present.
+        boosted,
+        /// A full, non-htmx request — direct navigation, refresh, or a
+        /// plain (non-AJAX, non-boosted) link/form submission.
+        /// - htmx 4.0: `HX-Request-Type: full`.
+        /// - htmx 2.x: none of the htmx headers present.
+        full,
+    };
+
+    /// Resolves `RequestKind` for the current request, automatically
+    /// bridging htmx 2.x and 4.0: it checks `HX-Request-Type` (4.0) first,
+    /// and falls back to the `HX-Request`/`HX-Boosted` header pair (2.x)
+    /// when that header is absent. There is no `.history_restore` variant —
+    /// htmx 4.0 removed the history-restore request case and always issues
+    /// a full request for history navigation.
+    ///
+    /// `isHtmx()` and `isBoosted()` remain fully valid and are unaffected by
+    /// this addition — `requestKind()` is a new convenience on top of them,
+    /// not a replacement. Existing call sites using `isHtmx()`/`isBoosted()`
+    /// keep working exactly as before.
+    pub fn requestKind(self: *Ctx) RequestKind {
+        if (self.requestType()) |rt| {
+            if (std.mem.eql(u8, rt, "partial")) return .fragment;
+            return .full;
+        }
+        if (self.isBoosted()) return .boosted;
+        if (self.isHtmx()) return .fragment;
+        return .full;
+    }
+
     pub fn cookie(self: *Ctx, name: []const u8) ?[]const u8 {
         const cookie_header = self.header("Cookie") orelse return null;
         var iter = std.mem.splitScalar(u8, cookie_header, ';');
