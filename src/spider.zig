@@ -9,6 +9,8 @@ pub const NextFn = @import("core/context.zig").NextFn;
 pub const MiddlewareFn = @import("core/context.zig").MiddlewareFn;
 pub const ErrorHandler = @import("core/context.zig").ErrorHandler;
 pub const Response = @import("core/context.zig").Response;
+pub const Path = @import("core/extractors.zig").Path;
+pub const Form = @import("core/extractors.zig").Form;
 pub const Database = @import("core/database.zig").Database;
 pub const DatabaseCtx = @import("core/context.zig").DatabaseCtx;
 pub const Config = @import("internal/config.zig").Config;
@@ -97,4 +99,5 @@ test {
     _ = @import("render/zmd/zmd.zig");
     _ = @import("render/template_test.zig");
     _ = @import("core/context_test.zig");
+    _ = @import("core/app_test.zig");
 }
