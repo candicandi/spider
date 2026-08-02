@@ -433,6 +433,91 @@ fn buildWrapper(comptime handler: anytype, comptime T: type) Handler {
     return W.call;
 }
 
+// Typed extractors (spider.Path/spider.Form, see core/extractors.zig) are
+// recognized by duck-typing on a `spider_kind` decl rather than importing
+// extractors.zig directly, so this file doesn't need to know that module
+// exists.
+fn isExtractor(comptime PT: type) bool {
+    return switch (@typeInfo(PT)) {
+        .@"struct", .@"enum", .@"union", .@"opaque" => @hasDecl(PT, "spider_kind"),
+        else => false,
+    };
+}
+
+// True when `handler`'s parameters require the extractor dispatch path
+// (buildAutoWrapper) instead of the classic decoration path (buildWrapper):
+// any recognized extractor param, or a *Ctx param anywhere but first.
+// Handlers with only *Ctx (at index 0) or only loose decoration types keep
+// going through buildWrapper, unchanged.
+fn usesExtractors(comptime handler: anytype) bool {
+    const fn_info = @typeInfo(@TypeOf(handler)).@"fn";
+    inline for (fn_info.param_types, 0..) |maybe_pt, i| {
+        const PT = maybe_pt orelse continue;
+        if (PT == *Ctx) {
+            if (i != 0) return true;
+        } else if (isExtractor(PT)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Dispatches handlers using spider.Path(...)/spider.Form(...) params (mixed
+// with *Ctx, in any order, no 4-param ceiling — unlike buildWrapper). Each
+// extractor resolves itself from `ctx`; on failure the wrapper returns a
+// fixed 400 response immediately, without calling the handler.
+fn buildAutoWrapper(comptime handler: anytype) Handler {
+    const fn_info = @typeInfo(@TypeOf(handler)).@"fn";
+
+    const W = struct {
+        pub fn call(ctx: *Ctx) anyerror!Response {
+            var args: std.meta.ArgsTuple(@TypeOf(handler)) = undefined;
+
+            inline for (fn_info.param_types, 0..) |maybe_pt, i| {
+                const PT = maybe_pt orelse @compileError("generic param not supported");
+
+                if (PT == *Ctx) {
+                    args[i] = ctx;
+                } else if (comptime isExtractor(PT)) {
+                    if (PT.spider_kind == .path) {
+                        const raw = ctx.params.get(PT.param_name) orelse return ctx.text(
+                            "missing path param: " ++ PT.param_name,
+                            .{ .status = .bad_request },
+                        );
+                        if (comptime PT.Inner == []const u8) {
+                            args[i] = .{ .value = raw };
+                        } else {
+                            const parsed = std.fmt.parseInt(PT.Inner, raw, 10) catch return ctx.text(
+                                "invalid path param: " ++ PT.param_name,
+                                .{ .status = .bad_request },
+                            );
+                            args[i] = .{ .value = parsed };
+                        }
+                    } else if (PT.spider_kind == .form) {
+                        const parsed = ctx.parseForm(PT.Inner) catch |err| return ctx.text(
+                            @errorName(err),
+                            .{ .status = .bad_request },
+                        );
+                        args[i] = .{ .value = parsed };
+                    } else {
+                        @compileError("unsupported spider extractor kind on " ++ @typeName(PT));
+                    }
+                } else {
+                    @compileError(
+                        "buildAutoWrapper only supports *Ctx and extractor params " ++
+                            "(spider.Path(...), spider.Form(...)); handler parameter `" ++
+                            @typeName(PT) ++ "` is neither. For loose-type decoration " ++
+                            "parameters, use the classic fn(*Ctx, T) !Response signature instead.",
+                    );
+                }
+            }
+
+            return @call(.auto, handler, args);
+        }
+    };
+    return W.call;
+}
+
 fn buildWsWrapper(comptime handler: fn (*Ws) anyerror!void) Handler {
     const W = struct {
         pub fn call(ctx: *Ctx) anyerror!Response {
@@ -599,7 +684,12 @@ pub fn Server(comptime T: type) type {
         }
 
         pub fn get(self: *Self, path: []const u8, handler: anytype, comptime config: anytype) *Self {
-            const H = if (@TypeOf(handler) == Handler) handler else buildWrapper(handler, T);
+            const H = if (@TypeOf(handler) == Handler)
+                handler
+            else if (comptime usesExtractors(handler))
+                buildAutoWrapper(handler)
+            else
+                buildWrapper(handler, T);
             self.router.add(.GET, path, H) catch unreachable;
             if (comptime (@hasField(@TypeOf(config), "roles") and config.roles.len > 0)) {
                 const rbac_mw = @import("../modules/rbac.zig").requireRoles(config.roles);
@@ -625,7 +715,12 @@ pub fn Server(comptime T: type) type {
         }
 
         pub fn post(self: *Self, path: []const u8, handler: anytype, comptime config: anytype) *Self {
-            const H = if (@TypeOf(handler) == Handler) handler else buildWrapper(handler, T);
+            const H = if (@TypeOf(handler) == Handler)
+                handler
+            else if (comptime usesExtractors(handler))
+                buildAutoWrapper(handler)
+            else
+                buildWrapper(handler, T);
             self.router.add(.POST, path, H) catch unreachable;
             if (comptime (@hasField(@TypeOf(config), "roles") and config.roles.len > 0)) {
                 const rbac_mw = @import("../modules/rbac.zig").requireRoles(config.roles);
@@ -651,7 +746,12 @@ pub fn Server(comptime T: type) type {
         }
 
         pub fn put(self: *Self, path: []const u8, handler: anytype, comptime config: anytype) *Self {
-            const H = if (@TypeOf(handler) == Handler) handler else buildWrapper(handler, T);
+            const H = if (@TypeOf(handler) == Handler)
+                handler
+            else if (comptime usesExtractors(handler))
+                buildAutoWrapper(handler)
+            else
+                buildWrapper(handler, T);
             self.router.add(.PUT, path, H) catch unreachable;
             if (comptime (@hasField(@TypeOf(config), "roles") and config.roles.len > 0)) {
                 const rbac_mw = @import("../modules/rbac.zig").requireRoles(config.roles);
@@ -677,7 +777,12 @@ pub fn Server(comptime T: type) type {
         }
 
         pub fn delete(self: *Self, path: []const u8, handler: anytype, comptime config: anytype) *Self {
-            const H = if (@TypeOf(handler) == Handler) handler else buildWrapper(handler, T);
+            const H = if (@TypeOf(handler) == Handler)
+                handler
+            else if (comptime usesExtractors(handler))
+                buildAutoWrapper(handler)
+            else
+                buildWrapper(handler, T);
             self.router.add(.DELETE, path, H) catch unreachable;
             if (comptime (@hasField(@TypeOf(config), "roles") and config.roles.len > 0)) {
                 const rbac_mw = @import("../modules/rbac.zig").requireRoles(config.roles);
@@ -703,7 +808,12 @@ pub fn Server(comptime T: type) type {
         }
 
         pub fn patch(self: *Self, path: []const u8, handler: anytype, comptime config: anytype) *Self {
-            const H = if (@TypeOf(handler) == Handler) handler else buildWrapper(handler, T);
+            const H = if (@TypeOf(handler) == Handler)
+                handler
+            else if (comptime usesExtractors(handler))
+                buildAutoWrapper(handler)
+            else
+                buildWrapper(handler, T);
             self.router.add(.PATCH, path, H) catch unreachable;
             if (comptime (@hasField(@TypeOf(config), "roles") and config.roles.len > 0)) {
                 const rbac_mw = @import("../modules/rbac.zig").requireRoles(config.roles);
@@ -729,7 +839,12 @@ pub fn Server(comptime T: type) type {
         }
 
         pub fn head(self: *Self, path: []const u8, handler: anytype, comptime config: anytype) *Self {
-            const H = if (@TypeOf(handler) == Handler) handler else buildWrapper(handler, T);
+            const H = if (@TypeOf(handler) == Handler)
+                handler
+            else if (comptime usesExtractors(handler))
+                buildAutoWrapper(handler)
+            else
+                buildWrapper(handler, T);
             self.router.add(.HEAD, path, H) catch unreachable;
             if (comptime (@hasField(@TypeOf(config), "roles") and config.roles.len > 0)) {
                 const rbac_mw = @import("../modules/rbac.zig").requireRoles(config.roles);
