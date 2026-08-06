@@ -352,12 +352,27 @@ fn handleConnection(ctx: ConnCtx) error{Canceled}!void {
 
         const final_body = response.body orelse "";
 
+        // std.http.Server.Request.discardBody() asserts that a body-bearing
+        // method always carries Content-Length or Transfer-Encoding when the
+        // connection is being kept alive — but that invariant isn't enforced
+        // at head-parsing time, so a malformed request (e.g. a bare POST with
+        // neither header) reaches discardBody() in a state that violates it,
+        // crashing the whole process with "reached unreachable code". Skip
+        // keep-alive for exactly that case: discardBody() only takes the
+        // asserting branch when keep_alive is true on both ends, so passing
+        // false here for a malformed request avoids the crash without paying
+        // the keep-alive cost on every other (well-formed) request.
+        const malformed_body_request = request.head.method.requestHasBody() and
+            request.head.transfer_encoding == .none and
+            request.head.content_length == null;
+
         request.respond(final_body, .{
             .status = response.status,
             .extra_headers = extra_headers_buf[0..header_count],
+            .keep_alive = !malformed_body_request,
         }) catch {};
 
-        if (!request.head.keep_alive) break;
+        if (!request.head.keep_alive or malformed_body_request) break;
     }
 }
 
