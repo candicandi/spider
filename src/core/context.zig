@@ -563,6 +563,29 @@ pub const Ctx = struct {
         return null;
     }
 
+    /// The immediate TCP peer's address (no port), allocated in `arena`.
+    ///
+    /// Behind a reverse proxy, this is the proxy's address, not the
+    /// original client's — `header("X-Forwarded-For")` is the right source
+    /// in that case. This exists for the direct-connection case (no proxy
+    /// in front, e.g. local dev or a LAN device hitting the server
+    /// directly), where no proxy ever adds that header, and callers would
+    /// otherwise have no way to identify who connected.
+    pub fn peerAddress(self: *Ctx) ?[]const u8 {
+        return switch (self._stream.socket.address) {
+            .ip4 => |a| std.fmt.allocPrint(
+                self.arena,
+                "{d}.{d}.{d}.{d}",
+                .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] },
+            ) catch null,
+            .ip6 => |a| std.fmt.allocPrint(
+                self.arena,
+                "{f}",
+                .{std.Io.net.Ip6Address.Unresolved{ .bytes = a.bytes, .interface_name = null }},
+            ) catch null,
+        };
+    }
+
     pub fn redirect(self: *Ctx, url: []const u8) !Response {
         const hdrs = try self.arena.alloc([2][]const u8, 1);
         hdrs[0] = .{ "Location", url };
